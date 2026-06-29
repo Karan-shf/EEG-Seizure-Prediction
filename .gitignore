@@ -62,3 +62,17 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 # Neon agents
 .agents
+
+# dataset
+data/
+
+# Jupyter Notebook Outputs
+.ipynb_checkpoints/
+
+# Experiment outputs — generated files, not source
+experiments/results/*
+experiments/logs/*
+experiments/checkpoints/*
+!experiments/results/.gitkeep
+!experiments/logs/.gitkeep
+!experiments/checkpoints/.gitkeep
