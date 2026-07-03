@@ -76,3 +76,8 @@ experiments/checkpoints/*
 !experiments/results/.gitkeep
 !experiments/logs/.gitkeep
 !experiments/checkpoints/.gitkeep
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
