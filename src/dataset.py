@@ -37,8 +37,10 @@ from torch.utils.data import Dataset, DataLoader
 # Constants
 # ---------------------------------------------------------------------------
 
-# Number of frames per sequence (30 min / 5 sec windows)
-N_FRAMES   = 360
+# Number of frames per sequence 
+# 40% overlap: 5s window, 3s stride over 1800s segment
+# floor((1800 * 256 - 5 * 256) / (3 * 256)) + 1 = 599
+N_FRAMES = 599
 
 # Number of frequency bands
 N_BANDS    = 5

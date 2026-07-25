@@ -43,7 +43,7 @@ METADATA_PATH = 'data/processed/metadata.csv'
 INTERICTAL_MIN_GAP = 3600
 
 # How many interictal sequences to extract per patient (at most)
-MAX_INTERICTAL_PER_PATIENT = 6
+MAX_INTERICTAL_PER_PATIENT = 10
 
 # Target sequence length in frames
 TARGET_FRAMES = PRE_ICTAL_SECS // WINDOW_SECONDS  # 360

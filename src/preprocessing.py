@@ -36,6 +36,7 @@ FREQUENCY_BANDS = [
 ]
 
 WINDOW_SECONDS   = 5       # length of each analysis window in seconds
+STRIDE_SECONDS  = 3        # 40% overlap: 5s window, 2s overlap, 3s step
 PRE_ICTAL_SECS   = 1800    # 30 minutes in seconds
 NOTCH_FREQ       = 60.0    # US powerline frequency (change to 50.0 for Europe)
 BANDPASS_LOW     = 0.5
@@ -170,16 +171,17 @@ def compute_sequence(
     target_n_windows: int | None = None,
 ) -> np.ndarray:
     """
-    Slide a 5-second window across segment_data and compute band power
-    for each window. Zero-pad at the beginning if the segment is shorter
-    than the target number of windows.
+    Slide a window across segment_data with STRIDE_SECONDS step and compute
+    band power for each window. Zero-pad at the beginning if the segment is
+    shorter than the target number of windows.
 
     Parameters
     ----------
     segment_data     : np.ndarray, shape (n_channels, n_samples)
     actual_duration  : float  — real duration of segment_data in seconds
     sfreq            : float  — sampling frequency in Hz
-    target_n_windows : int    — desired sequence length (default: PRE_ICTAL_SECS // WINDOW_SECONDS = 360)
+    target_n_windows : int    — desired sequence length
+                                default: computed from PRE_ICTAL_SECS and STRIDE_SECONDS
 
     Returns
     -------
@@ -187,42 +189,50 @@ def compute_sequence(
         Time-ordered sequence of band power maps.
         Early frames are zeros if segment was shorter than target.
     """
+    samples_per_win    = int(WINDOW_SECONDS * sfreq)
+    samples_per_stride = int(STRIDE_SECONDS * sfreq)
+
     if target_n_windows is None:
-        target_n_windows = PRE_ICTAL_SECS // WINDOW_SECONDS  # 360
+        # How many overlapping windows fit in a full PRE_ICTAL_SECS segment
+        target_n_windows = (
+            (int(PRE_ICTAL_SECS * sfreq) - samples_per_win) // samples_per_stride
+        ) + 1
 
-    n_channels      = segment_data.shape[0]
-    samples_per_win = int(WINDOW_SECONDS * sfreq)
-    n_bands         = len(FREQUENCY_BANDS)
+    n_channels = segment_data.shape[0]
+    n_bands    = len(FREQUENCY_BANDS)
 
-    # How many complete windows fit in the actual segment
-    n_available_windows = int(actual_duration) // WINDOW_SECONDS
+    # How many windows fit in the actual available segment
+    n_samples_available = int(actual_duration * sfreq)
+    if n_samples_available < samples_per_win:
+        return np.zeros((target_n_windows, n_bands, n_channels), dtype=np.float32)
 
-    # Cap at target in case segment is longer than 30 minutes
+    n_available_windows = (
+        (n_samples_available - samples_per_win) // samples_per_stride
+    ) + 1
+
+    # Cap at target in case segment is longer than PRE_ICTAL_SECS
     n_windows_to_compute = min(n_available_windows, target_n_windows)
 
-    # Initialise output with zeros (zero-padding is already handled here)
+    # Initialise output with zeros (zero-padding handled here)
     sequence = np.zeros((target_n_windows, n_bands, n_channels), dtype=np.float32)
 
-    # We want the computed windows to sit at the END of the sequence
-    # (they lead up to seizure onset — the most recent windows are last)
+    # Computed windows sit at the END of the sequence
+    # (most recent frames = just before seizure onset)
     start_frame = target_n_windows - n_windows_to_compute
 
     for i in range(n_windows_to_compute):
-        # Work backwards from end of segment so frame ordering is chronological
-        # Window 0 in the loop = earliest window; window N-1 = just before seizure
-        sample_start = i * samples_per_win
+        sample_start = i * samples_per_stride
         sample_end   = sample_start + samples_per_win
 
-        # Guard against going past the end of data
         if sample_end > segment_data.shape[1]:
             break
 
         window_data = segment_data[:, sample_start:sample_end]
-        band_map    = _band_power_single_window(window_data, sfreq)  # (5, n_channels)
+        band_map    = _band_power_single_window(window_data, sfreq)
 
         sequence[start_frame + i] = band_map
 
-    return sequence  # shape: (360, 5, n_channels)
+    return sequence
 
 
 # ---------------------------------------------------------------------------

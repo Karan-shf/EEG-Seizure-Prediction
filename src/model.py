@@ -73,7 +73,7 @@ class ModelConfig:
         model  = SeizurePredictor(config)
     """
     # Input dimensions — must match dataset.py constants
-    n_frames:   int = 360
+    n_frames:   int = 599
     n_bands:    int = 5
     n_channels: int = 17
 
