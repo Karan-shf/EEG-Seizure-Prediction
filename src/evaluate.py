@@ -54,6 +54,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import SeizureDataset, get_splits, make_dataloaders
 from model import SeizurePredictor, ModelConfig
+from logger import get_logger
+
+logger = get_logger(name='evaluate')
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -93,7 +96,7 @@ def load_model(checkpoint_path: str) -> SeizurePredictor:
         )
 
     ckpt = torch.load(checkpoint_path, map_location='cpu')
-    print(f'Loaded checkpoint from epoch {ckpt["epoch"]} '
+    logger.info(f'Loaded checkpoint from epoch {ckpt["epoch"]} '
           f'(val AUC = {ckpt["val_auc"]:.4f})')
 
     config = ModelConfig(**ckpt['model_config'])
@@ -305,7 +308,7 @@ def plot_roc_curve(metrics: dict, save_path: str):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'ROC curve saved to {save_path}')
+    logger.info(f'ROC curve saved to {save_path}')
 
 
 def plot_confusion_matrix(metrics: dict, save_path: str):
@@ -340,7 +343,7 @@ def plot_confusion_matrix(metrics: dict, save_path: str):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'Confusion matrix saved to {save_path}')
+    logger.info(f'Confusion matrix saved to {save_path}')
 
 
 def plot_attention_heatmap(results: dict, save_path: str,
@@ -366,7 +369,7 @@ def plot_attention_heatmap(results: dict, save_path: str,
     indices = np.where(correct_preictal)[0]
 
     if len(indices) == 0:
-        print('[Attention] No correctly predicted preictal sequences found.')
+        logger.info('[Attention] No correctly predicted preictal sequences found.')
         return
 
     # Take up to n_samples
@@ -419,7 +422,7 @@ def plot_attention_heatmap(results: dict, save_path: str,
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'Attention heatmap saved to {save_path}')
+    logger.info(f'Attention heatmap saved to {save_path}')
 
 
 def plot_mean_attention(results: dict, save_path: str):
@@ -439,7 +442,7 @@ def plot_mean_attention(results: dict, save_path: str):
     indices          = np.where(correct_preictal)[0]
 
     if len(indices) == 0:
-        print('[Mean Attention] No correctly predicted preictal sequences.')
+        logger.info('[Mean Attention] No correctly predicted preictal sequences.')
         return
 
     attn_subset = attns[indices]              # (n_correct, 360)
@@ -481,9 +484,9 @@ def plot_mean_attention(results: dict, save_path: str):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'Mean attention curve saved to {save_path}')
-    print(f'  → Model peaks at {peak_time:.1f} minutes before seizure onset')
-    print(f'     (clinical implication: pre-ictal changes detectable '
+    logger.info(f'Mean attention curve saved to {save_path}')
+    logger.info(f'  → Model peaks at {peak_time:.1f} minutes before seizure onset')
+    logger.info(f'     (clinical implication: pre-ictal changes detectable '
           f'~{abs(peak_time):.0f} min before seizure)')
 
 
@@ -494,37 +497,37 @@ def plot_mean_attention(results: dict, save_path: str):
 def print_report(metrics: dict, per_patient: pd.DataFrame,
                  checkpoint_path: str):
     """Print a clean evaluation report to terminal."""
-    print('\n' + '=' * 55)
-    print('SeizureHorizon — Evaluation Report')
-    print('=' * 55)
-    print(f'Checkpoint : {checkpoint_path}')
-    print(f'Threshold  : {metrics["threshold"]}')
-    print()
-    print('── Overall metrics (test patients) ─────────────────')
-    print(f'  ROC-AUC         : {metrics["auc"]:.4f}')
-    print(f'  Sensitivity      : {metrics["sensitivity"]:.4f}  '
+    logger.info('\n' + '=' * 55)
+    logger.info('SeizureHorizon — Evaluation Report')
+    logger.info('=' * 55)
+    logger.info(f'Checkpoint : {checkpoint_path}')
+    logger.info(f'Threshold  : {metrics["threshold"]}')
+    logger.info("")
+    logger.info('── Overall metrics (test patients) ─────────────────')
+    logger.info(f'  ROC-AUC         : {metrics["auc"]:.4f}')
+    logger.info(f'  Sensitivity      : {metrics["sensitivity"]:.4f}  '
           f'({metrics["tp"]} / {metrics["tp"] + metrics["fn"]} preictal detected)')
-    print(f'  Specificity      : {metrics["specificity"]:.4f}  '
+    logger.info(f'  Specificity      : {metrics["specificity"]:.4f}  '
           f'({metrics["tn"]} / {metrics["tn"] + metrics["fp"]} interictal correct)')
-    print(f'  F1 Score         : {metrics["f1"]:.4f}')
-    print(f'  Accuracy         : {metrics["accuracy"]:.4f}')
-    print(f'  PPV (Precision)  : {metrics["ppv"]:.4f}')
-    print(f'  NPV              : {metrics["npv"]:.4f}')
-    print()
-    print('── Clinical metric ──────────────────────────────────')
-    print(f'  FPR/h            : {metrics["fpr_per_hour"]:.4f} false alarms per hour')
+    logger.info(f'  F1 Score         : {metrics["f1"]:.4f}')
+    logger.info(f'  Accuracy         : {metrics["accuracy"]:.4f}')
+    logger.info(f'  PPV (Precision)  : {metrics["ppv"]:.4f}')
+    logger.info(f'  NPV              : {metrics["npv"]:.4f}')
+    logger.info("")
+    logger.info('── Clinical metric ──────────────────────────────────')
+    logger.info(f'  FPR/h            : {metrics["fpr_per_hour"]:.4f} false alarms per hour')
     clinical = ('✓ Clinically acceptable (< 0.1/h)'
                 if metrics['fpr_per_hour'] < 0.1
                 else '✗ Above clinical threshold (> 0.1/h)')
-    print(f'  Assessment       : {clinical}')
-    print()
-    print('── Confusion matrix ─────────────────────────────────')
-    print(f'  TP={metrics["tp"]}  FP={metrics["fp"]}')
-    print(f'  FN={metrics["fn"]}  TN={metrics["tn"]}')
-    print()
-    print('── Per-patient breakdown ────────────────────────────')
-    print(per_patient.to_string(index=False))
-    print('=' * 55)
+    logger.info(f'  Assessment       : {clinical}')
+    logger.info("")
+    logger.info('── Confusion matrix ─────────────────────────────────')
+    logger.info(f'  TP={metrics["tp"]}  FP={metrics["fp"]}')
+    logger.info(f'  FN={metrics["fn"]}  TN={metrics["tn"]}')
+    logger.info("")
+    logger.info('── Per-patient breakdown ────────────────────────────')
+    logger.info(per_patient.to_string(index=False))
+    logger.info('=' * 55)
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +537,7 @@ def print_report(metrics: dict, per_patient: pd.DataFrame,
 def evaluate():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = torch.device(DEVICE)
-    print(f'[Evaluate] Device: {device}')
+    logger.info(f'[Evaluate] Device: {device}')
 
     # --- Load model ---
     model = load_model(CHECKPOINT_PATH)
@@ -552,7 +555,7 @@ def evaluate():
         num_workers=0,
     )
 
-    print(f'\n[Evaluate] Running inference on {len(test_loader.dataset)} '
+    logger.info(f'\n[Evaluate] Running inference on {len(test_loader.dataset)} '
           f'test sequences from patients: {test_p}')
 
     # --- Inference ---
@@ -571,12 +574,12 @@ def evaluate():
     metrics_path = os.path.join(OUTPUT_DIR, 'metrics.json')
     with open(metrics_path, 'w') as f:
         json.dump(metrics_save, f, indent=2)
-    print(f'\nMetrics saved to {metrics_path}')
+    logger.info(f'\nMetrics saved to {metrics_path}')
 
     # --- Save per-patient table ---
     table_path = os.path.join(OUTPUT_DIR, 'per_patient_metrics.csv')
     per_patient.to_csv(table_path, index=False)
-    print(f'Per-patient table saved to {table_path}')
+    logger.info(f'Per-patient table saved to {table_path}')
 
     # --- Plots ---
     plot_roc_curve(
@@ -596,7 +599,7 @@ def evaluate():
         os.path.join(OUTPUT_DIR, 'mean_attention.png')
     )
 
-    print(f'\n[Evaluate] All outputs saved to {OUTPUT_DIR}/')
+    logger.info(f'\n[Evaluate] All outputs saved to {OUTPUT_DIR}/')
     return metrics, per_patient, results
 
 

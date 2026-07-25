@@ -10,7 +10,7 @@ What it does
 3. Trains for up to max_epochs with early stopping on validation AUC
 4. Saves the best checkpoint whenever validation AUC improves
 5. Logs per-epoch metrics to experiments/logs/ for TensorBoard
-6. Prints a clean training summary at the end
+6. logger.infos a clean training summary at the end
 
 Run
 ---
@@ -41,7 +41,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import SeizureDataset, get_splits, make_dataloaders
 from model import SeizurePredictor, ModelConfig, model_summary
+from logger import get_logger
 
+logger = get_logger(name='train')
 
 # ---------------------------------------------------------------------------
 # Training configuration
@@ -261,7 +263,7 @@ def plot_training_curves(history: dict, save_path: str):
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'Training curves saved to {save_path}')
+    logger.info(f'Training curves saved to {save_path}')
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +285,7 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     os.makedirs(train_cfg.results_dir,    exist_ok=True)
 
     device = torch.device(train_cfg.device)
-    print(f'\n[Train] Device: {device}')
+    logger.info(f'\n[Train] Device: {device}')
 
     # --- Data ---
     meta   = pd.read_csv(train_cfg.metadata_path)
@@ -338,11 +340,11 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
         'best_epoch': 1,
     }
 
-    print(f'\n[Train] Starting training — max {train_cfg.max_epochs} epochs '
+    logger.info(f'\n[Train] Starting training — max {train_cfg.max_epochs} epochs '
           f'| patience {train_cfg.patience}\n')
-    print(f'{"Epoch":>6} {"Train Loss":>11} {"Val Loss":>10} '
+    logger.info(f'{"Epoch":>6} {"Train Loss":>11} {"Val Loss":>10} '
           f'{"Train AUC":>10} {"Val AUC":>9} {"LR":>10} {"":>8}')
-    print('-' * 72)
+    logger.info('-' * 72)
 
     for epoch in range(1, train_cfg.max_epochs + 1):
         t0 = time.time()
@@ -378,19 +380,19 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
             epochs_no_improve += 1
 
         elapsed = time.time() - t0
-        print(f'{epoch:>6} {train_loss:>11.4f} {val_loss:>10.4f} '
+        logger.info(f'{epoch:>6} {train_loss:>11.4f} {val_loss:>10.4f} '
               f'{train_auc:>10.4f} {val_auc:>9.4f} '
               f'{current_lr:>10.2e}  {improved}')
 
         # Early stopping
         if epochs_no_improve >= train_cfg.patience:
-            print(f'\n[Train] Early stopping at epoch {epoch} '
+            logger.info(f'\n[Train] Early stopping at epoch {epoch} '
                   f'(no improvement for {train_cfg.patience} epochs)')
             break
 
-    print(f'\n[Train] Training complete.')
-    print(f'  Best val AUC : {best_val_auc:.4f} at epoch {best_epoch}')
-    print(f'  Checkpoint   : {checkpoint_path}')
+    logger.info(f'\n[Train] Training complete.')
+    logger.info(f'  Best val AUC : {best_val_auc:.4f} at epoch {best_epoch}')
+    logger.info(f'  Checkpoint   : {checkpoint_path}')
 
     # Save training history as JSON
     history_path = os.path.join(train_cfg.results_dir, 'training_history.json')
@@ -412,17 +414,17 @@ if __name__ == '__main__':
     train_cfg = TrainConfig()
     model_cfg = ModelConfig()
 
-    print('=' * 55)
-    print('SeizureHorizon — Training')
-    print('=' * 55)
-    print(f'Split strategy : {train_cfg.split_strategy}')
-    print(f'Max epochs     : {train_cfg.max_epochs}')
-    print(f'Batch size     : {train_cfg.batch_size}')
-    print(f'Learning rate  : {train_cfg.learning_rate}')
-    print(f'Early stopping : patience={train_cfg.patience}')
-    print(f'Device         : {train_cfg.device}')
+    logger.info('=' * 55)
+    logger.info('SeizureHorizon — Training')
+    logger.info('=' * 55)
+    logger.info(f'Split strategy : {train_cfg.split_strategy}')
+    logger.info(f'Max epochs     : {train_cfg.max_epochs}')
+    logger.info(f'Batch size     : {train_cfg.batch_size}')
+    logger.info(f'Learning rate  : {train_cfg.learning_rate}')
+    logger.info(f'Early stopping : patience={train_cfg.patience}')
+    logger.info(f'Device         : {train_cfg.device}')
 
     model, best_auc, history = train(train_cfg, model_cfg)
 
-    print(f'\nFinal best validation AUC: {best_auc:.4f}')
-    print('Run evaluate.py next to test on held-out patients.')
+    logger.info(f'\nFinal best validation AUC: {best_auc:.4f}')
+    logger.info('Run evaluate.py next to test on held-out patients.')
