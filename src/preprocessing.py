@@ -37,7 +37,8 @@ FREQUENCY_BANDS = [
 
 WINDOW_SECONDS   = 5       # length of each analysis window in seconds
 STRIDE_SECONDS  = 3        # 40% overlap: 5s window, 2s overlap, 3s step
-PRE_ICTAL_SECS   = 1800    # 30 minutes in seconds
+PRE_ICTAL_SECS   = 1800    # 30 minutes in seconds (default duration)
+DEFAULT_OFFSET_SECONDS = 0  # default: window ends exactly at seizure onset
 NOTCH_FREQ       = 60.0    # US powerline frequency (change to 50.0 for Europe)
 BANDPASS_LOW     = 0.5
 BANDPASS_HIGH    = 40.0
@@ -85,17 +86,33 @@ def load_and_filter(edf_path: str) -> mne.io.BaseRaw:
 # Step 2 — Extract a time segment
 # ---------------------------------------------------------------------------
 
-def extract_segment(raw: mne.io.BaseRaw, end_time: float, duration: float) -> tuple[np.ndarray, float]:
+def extract_segment(
+    raw: mne.io.BaseRaw,
+    anchor_time: float,
+    duration: float,
+    offset: float = 0.0,
+) -> tuple[np.ndarray, float]:
     """
-    Extract a segment of EEG ending at `end_time` and going back `duration`
-    seconds. If the recording starts after (end_time - duration), the segment
-    starts from t=0 instead (shorter than requested — caller handles padding).
+    Extract a segment of EEG ending `offset` seconds before `anchor_time`,
+    spanning `duration` seconds. If the recording starts after the computed
+    segment_start, the segment starts from t=0 instead (shorter than
+    requested — caller handles zero-padding).
+
+    The window is defined as:
+        segment_end   = anchor_time - offset
+        segment_start = segment_end - duration
+
+    Example: anchor_time=seizure onset, offset=900 (15 min), duration=1800 (30 min)
+    → window spans from 45 min before onset to 15 min before onset.
 
     Parameters
     ----------
-    raw       : mne.io.Raw   — filtered recording
-    end_time  : float        — segment end in seconds (e.g. seizure onset)
-    duration  : float        — how many seconds to go back from end_time
+    raw         : mne.io.Raw — filtered recording
+    anchor_time : float      — reference point in seconds (e.g. seizure onset)
+    duration    : float      — length of the window in seconds
+    offset      : float      — gap in seconds between the window's end and
+                                anchor_time. offset=0 means the window ends
+                                exactly at anchor_time (original behaviour).
 
     Returns
     -------
@@ -106,8 +123,15 @@ def extract_segment(raw: mne.io.BaseRaw, end_time: float, duration: float) -> tu
         May be less than `duration` if the recording started late.
     """
     recording_start = 0.0
-    segment_start   = max(recording_start, end_time - duration)
-    segment_end     = end_time
+    segment_end      = anchor_time - offset
+    segment_start    = max(recording_start, segment_end - duration)
+
+    if segment_end <= recording_start:
+        raise ValueError(
+            f'Segment end ({segment_end:.1f}s) is at or before recording '
+            f'start. anchor_time={anchor_time}s, offset={offset}s. '
+            f'This configuration has no valid EEG to extract.'
+        )
 
     actual_duration = segment_end - segment_start
 
@@ -116,14 +140,13 @@ def extract_segment(raw: mne.io.BaseRaw, end_time: float, duration: float) -> tu
             f'Segment too short: only {actual_duration:.1f}s available '
             f'(minimum required: {MIN_AVAILABLE_SECS}s). '
             f'Recording ends at {raw.times[-1]:.1f}s, '
-            f'requested end_time={end_time}s.'
+            f'anchor_time={anchor_time}s, offset={offset}s.'
         )
 
     raw_segment = raw.copy().crop(tmin=segment_start, tmax=segment_end)
-    data = raw_segment.get_data()  # shape: (n_channels, n_samples)
+    data = np.asarray(raw_segment.get_data())  # shape: (n_channels, n_samples)
 
-    return data, actual_duration # type: ignore
-
+    return data, actual_duration
 
 # ---------------------------------------------------------------------------
 # Step 3 — Band power for one window
@@ -241,28 +264,63 @@ def compute_sequence(
 
 def build_sequence_from_edf(
     edf_path: str,
-    end_time: float,
+    anchor_time: float,
     duration: float = PRE_ICTAL_SECS,
+    offset: float = 0.0,
+    target_n_windows: int | None = None,
 ) -> tuple:
     """
     Full pipeline: load EDF → filter → extract segment → compute sequence.
 
     Parameters
     ----------
-    edf_path  : str   — path to .edf file
-    end_time  : float — end of segment in seconds (seizure onset or interictal anchor)
-    duration  : float — how many seconds before end_time to include (default 1800 = 30 min)
+    edf_path         : str   — path to .edf file
+    anchor_time       : float — reference point in seconds (seizure onset
+                                 or interictal anchor point)
+    duration         : float — length of the window in seconds
+                                (default 1800 = 30 min)
+    offset           : float — gap in seconds between window end and
+                                anchor_time (default 0 = window ends
+                                exactly at anchor_time, original behaviour)
+    target_n_windows : int   — desired sequence length in frames.
+                                If None, computed automatically from
+                                duration, WINDOW_SECONDS, and STRIDE_SECONDS.
 
     Returns
     -------
-    sequence  : np.ndarray, shape (360, 5, n_channels)
+    sequence  : np.ndarray, shape (target_n_windows, 5, n_channels)
     sfreq     : float — sampling frequency (needed by caller for reference)
     n_channels: int   — number of EEG channels in this recording
     """
     raw = load_and_filter(edf_path)
     sfreq = raw.info['sfreq']
 
-    segment_data, actual_duration = extract_segment(raw, end_time, duration)
-    sequence = compute_sequence(segment_data, actual_duration, sfreq)
+    segment_data, actual_duration = extract_segment(
+        raw, anchor_time, duration, offset=offset
+    )
+
+    # Compute target_n_windows from THIS call's duration if not provided,
+    # rather than relying on the global PRE_ICTAL_SECS default
+    if target_n_windows is None:
+        samples_per_win    = int(WINDOW_SECONDS * sfreq)
+        samples_per_stride = int(STRIDE_SECONDS * sfreq)
+        target_n_windows = (
+            (int(duration * sfreq) - samples_per_win) // samples_per_stride
+        ) + 1
+
+    sequence = compute_sequence(
+        segment_data, actual_duration, sfreq,
+        target_n_windows=target_n_windows
+    )
 
     return sequence, sfreq, segment_data.shape[0]
+
+
+if __name__ == "__main__":
+
+    for duration_min in [15, 30, 45, 60]:
+        duration_sec = duration_min * 60
+        samples_per_win    = int(WINDOW_SECONDS * 256)   # sfreq=256 typical CHB-MIT
+        samples_per_stride = int(STRIDE_SECONDS * 256)
+        n_frames = ((int(duration_sec * 256) - samples_per_win) // samples_per_stride) + 1
+        print(f'{duration_min:>3} min duration → {n_frames} frames')

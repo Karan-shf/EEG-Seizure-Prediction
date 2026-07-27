@@ -29,24 +29,21 @@ import json
 import numpy as np
 
 from parse_summaries import parse_all_summaries, get_all_seizure_events
-from preprocessing import build_sequence_from_edf, PRE_ICTAL_SECS, WINDOW_SECONDS
+from preprocessing import build_sequence_from_edf, PRE_ICTAL_SECS, WINDOW_SECONDS, STRIDE_SECONDS
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CHBMIT_ROOT   = 'data/raw/chb-mit'
-OUTPUT_DIR    = 'data/processed/sequences'
-METADATA_PATH = 'data/processed/metadata.csv'
+# AFTER
+CHBMIT_ROOT = 'data/raw/chb-mit'
 
-# Minimum gap in seconds between any seizure and an interictal anchor point
 INTERICTAL_MIN_GAP = 3600
-
-# How many interictal sequences to extract per patient (at most)
 MAX_INTERICTAL_PER_PATIENT = 10
 
-# Target sequence length in frames
-TARGET_FRAMES = PRE_ICTAL_SECS // WINDOW_SECONDS  # 360
+# TARGET_FRAMES is now computed per-config inside build_dataset(),
+# since it depends on that config's duration_minutes — no longer a
+# fixed global constant.
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +126,9 @@ def process_preictal_event(
     event_idx: int,
     edf_path: str,
     output_dir: str,
+    offset_sec: float,
+    duration_sec: float,
+    target_frames: int,
 ) -> dict | None:
     """
     Extract a pre-ictal sequence for one seizure event and save it.
@@ -150,15 +150,17 @@ def process_preictal_event(
     try:
         sequence, sfreq, n_ch = build_sequence_from_edf(
             edf_path,
-            end_time=float(onset),
-            duration=float(PRE_ICTAL_SECS),
+            anchor_time=float(onset),
+            duration=float(duration_sec),
+            offset=float(offset_sec),
+            target_n_windows=target_frames,
         )
         np.save(save_path, sequence)
         print(f'  [SAVED] {save_name}  shape={sequence.shape}  sfreq={sfreq}')
 
         # Count how many leading frames are zero-padded
         non_zero_frames = int(np.any(sequence != 0, axis=(1, 2)).sum())
-        padded_frames   = TARGET_FRAMES - non_zero_frames
+        padded_frames   = target_frames - non_zero_frames
         note = f'padded_frames={padded_frames}' if padded_frames > 0 else 'full'
 
         return _make_metadata_row(
@@ -186,6 +188,9 @@ def process_interictal_events(
     seizure_onsets: list,
     inter_event_counter: list,   # mutable counter shared across calls
     output_dir: str,
+    offset_sec: float,
+    duration_sec: float,
+    target_frames: int,
 ) -> list:
     """
     Extract interictal sequences from a recording file and save them.
@@ -226,8 +231,10 @@ def process_interictal_events(
         try:
             sequence, sfreq, n_ch = build_sequence_from_edf(
                 edf_path,
-                end_time=float(anchor),
-                duration=float(PRE_ICTAL_SECS),
+                anchor_time=float(anchor),
+                duration=float(duration_sec),
+                offset=float(offset_sec),
+                target_n_windows=target_frames,
             )
             np.save(save_path, sequence)
             print(f'  [SAVED] {save_name}  shape={sequence.shape}')
@@ -269,20 +276,60 @@ def _make_metadata_row(
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def build_dataset():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def build_dataset(
+    offset_minutes: float = 0,
+    duration_minutes: float = 30,
+    output_root: str = 'data/processed',
+    config_name: str | None = None,
+):
+    """
+    Build a full dataset for one (offset, duration) window configuration.
+
+    Parameters
+    ----------
+    offset_minutes   : float — gap in minutes between window end and seizure onset
+                        0 = window ends exactly at onset (original behaviour)
+    duration_minutes : float — length of the window in minutes
+    output_root       : str  — base directory; a config-specific subfolder
+                                is created beneath it
+    config_name        : str  — folder/file naming; auto-generated if None
+                                e.g. 'offset15_dur30'
+
+    Output structure
+    -----------------
+    {output_root}/{config_name}/sequences/*.npy
+    {output_root}/{config_name}/metadata.csv
+    """
+    if config_name is None:
+        config_name = f'offset{int(offset_minutes)}_dur{int(duration_minutes)}'
+
+    output_dir    = os.path.join(output_root, config_name, 'sequences')
+    metadata_path = os.path.join(output_root, config_name, 'metadata.csv')
+
+    offset_sec   = offset_minutes * 60
+    duration_sec = duration_minutes * 60
+
+    # Compute target frame count for this specific duration
+    # (must match the logic in preprocessing.build_sequence_from_edf)
+    samples_per_win    = int(WINDOW_SECONDS * 256)     # 256 Hz standard CHB-MIT rate
+    samples_per_stride = int(STRIDE_SECONDS * 256)
+    target_frames = (
+        (int(duration_sec * 256) - samples_per_win) // samples_per_stride
+    ) + 1
+
+    os.makedirs(output_dir, exist_ok=True)
 
     print('=' * 60)
-    print('SeizureHorizon — Dataset Builder')
+    print(f'SeizureHorizon — Dataset Builder — [{config_name}]')
     print('=' * 60)
-    print(f'CHB-MIT root  : {CHBMIT_ROOT}')
-    print(f'Output dir    : {OUTPUT_DIR}')
-    print(f'Metadata file : {METADATA_PATH}')
-    print(f'Window size   : {WINDOW_SECONDS}s')
-    print(f'Pre-ictal len : {PRE_ICTAL_SECS}s ({TARGET_FRAMES} frames)')
+    print(f'CHB-MIT root   : {CHBMIT_ROOT}')
+    print(f'Output dir     : {output_dir}')
+    print(f'Metadata file  : {metadata_path}')
+    print(f'Offset         : {offset_minutes} min ({offset_sec:.0f}s)')
+    print(f'Duration       : {duration_minutes} min ({duration_sec:.0f}s)')
+    print(f'Target frames  : {target_frames}')
     print()
 
-    # Step 1 — Parse all summary files
     print('Step 1: Parsing summary files...')
     seizure_index = parse_all_summaries(CHBMIT_ROOT)
     all_events    = get_all_seizure_events(seizure_index)
@@ -290,7 +337,6 @@ def build_dataset():
 
     metadata_rows = []
 
-    # Step 2 — Process each patient
     for patient_id, patient_data in sorted(seizure_index.items()):
         print(f'\n{"─" * 50}')
         print(f'Patient: {patient_id}')
@@ -299,9 +345,9 @@ def build_dataset():
         patient_dir    = os.path.join(CHBMIT_ROOT, patient_id)
         seizure_times  = get_patient_seizure_times(patient_data)
         preictal_count = 0
-        inter_counter  = [0]   # mutable list so subfunction can increment
+        inter_counter  = [0]
 
-        # Group seizure events by file and sort by onset to detect close pairs
+        # --- Pre-ictal sequences ---
         for filename, seizures in sorted(patient_data.items()):
             if not seizures:
                 continue
@@ -312,16 +358,15 @@ def build_dataset():
                 continue
 
             print(f'\n  File: {filename}')
-
-            # --- Pre-ictal sequences ---
-            prev_offset = None   # track previous seizure's end for close-pair detection
+            prev_offset = None
 
             for sz in sorted(seizures, key=lambda x: x['onset']):
                 onset  = sz['onset']
                 offset = sz['offset']
 
-                # Skip if this seizure starts too soon after the previous one ended
-                if prev_offset is not None and onset - prev_offset < PRE_ICTAL_SECS:
+                # Skip if too close to previous seizure given this window's reach
+                min_gap_needed = offset_sec + duration_sec
+                if prev_offset is not None and onset - prev_offset < min_gap_needed:
                     print(f'  [SKIP — too close to previous seizure] '
                           f'onset={onset}s, prev_offset={prev_offset}s')
                     prev_offset = offset
@@ -329,26 +374,21 @@ def build_dataset():
 
                 preictal_count += 1
                 row = process_preictal_event(
-                    patient_id, filename, onset, preictal_count, edf_path, OUTPUT_DIR
+                    patient_id, filename, onset, preictal_count, edf_path, output_dir,
+                    offset_sec=offset_sec,
+                    duration_sec=duration_sec,
+                    target_frames=target_frames,
                 )
                 if row:
                     metadata_rows.append(row)
 
                 prev_offset = offset
 
-            # # --- Interictal sequences ---
-            # all_onsets_in_file = seizure_times.get(filename, [])
-            # inter_rows = process_interictal_events(
-            #     patient_id, filename, edf_path,
-            #     all_onsets_in_file, inter_counter, OUTPUT_DIR
-            # )
-            # metadata_rows.extend(inter_rows)
-
-        # interictal sequences (ALL files, including seizure-free ones)
-        patient_inter_count = 0
+        # --- Interictal sequences ---
         for filename, seizures in sorted(patient_data.items()):
-            if patient_inter_count >= MAX_INTERICTAL_PER_PATIENT:   
+            if inter_counter[0] >= MAX_INTERICTAL_PER_PATIENT:
                 break
+
             edf_path = os.path.join(patient_dir, filename)
             if not os.path.exists(edf_path):
                 continue
@@ -356,38 +396,49 @@ def build_dataset():
             all_onsets_in_file = seizure_times.get(filename, [])
             inter_rows = process_interictal_events(
                 patient_id, filename, edf_path,
-                all_onsets_in_file, inter_counter, OUTPUT_DIR
+                all_onsets_in_file, inter_counter, output_dir,
+                offset_sec=offset_sec,
+                duration_sec=duration_sec,
+                target_frames=target_frames,
             )
             metadata_rows.extend(inter_rows)
-            patient_inter_count += len(inter_rows)
 
-    # Step 3 — Write metadata CSV
+    # --- Write metadata CSV ---
     print(f'\n{"=" * 60}')
-    print(f'Writing metadata to {METADATA_PATH} ...')
+    print(f'Writing metadata to {metadata_path} ...')
 
     fieldnames = [
         'filename', 'patient_id', 'source_edf', 'type', 'label',
         'anchor_sec', 'n_frames', 'n_bands', 'n_channels', 'note'
     ]
 
-    with open(METADATA_PATH, 'w', newline='') as f:
+    with open(metadata_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(metadata_rows)
 
-    # Summary statistics
     preictal_rows   = [r for r in metadata_rows if r['label'] == 1]
     interictal_rows = [r for r in metadata_rows if r['label'] == 0]
     patients_done   = len(set(r['patient_id'] for r in metadata_rows))
 
-    print(f'\nDataset summary')
+    print(f'\nDataset summary [{config_name}]')
     print(f'  Patients processed  : {patients_done}')
     print(f'  Pre-ictal sequences : {len(preictal_rows)}')
     print(f'  Interictal sequences: {len(interictal_rows)}')
     print(f'  Total sequences     : {len(metadata_rows)}')
-    print(f'  Metadata saved to   : {METADATA_PATH}')
-    print('\nDataset build complete.')
+    print(f'  Metadata saved to   : {metadata_path}')
+    print(f'\nDataset build complete for [{config_name}].')
+
+    return {
+        'config_name':   config_name,
+        'output_dir':    output_dir,
+        'metadata_path': metadata_path,
+        'target_frames': target_frames,
+        'n_preictal':    len(preictal_rows),
+        'n_interictal':  len(interictal_rows),
+    }
 
 
 if __name__ == '__main__':
-    build_dataset()
+    # Default: original 30-minute window ending at seizure onset
+    build_dataset(offset_minutes=0, duration_minutes=30)

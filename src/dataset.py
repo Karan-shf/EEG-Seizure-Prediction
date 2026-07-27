@@ -37,10 +37,10 @@ from torch.utils.data import Dataset, DataLoader
 # Constants
 # ---------------------------------------------------------------------------
 
-# Number of frames per sequence 
-# 40% overlap: 5s window, 3s stride over 1800s segment
-# floor((1800 * 256 - 5 * 256) / (3 * 256)) + 1 = 599
-N_FRAMES = 599
+# N_FRAMES is no longer a fixed global — it varies per experiment
+# configuration (offset/duration combination). It is now inferred
+# directly from the .npy files themselves at dataset load time,
+# so no manual bookkeeping is needed when running the grid search.
 
 # Number of frequency bands
 N_BANDS    = 5
@@ -388,6 +388,27 @@ def make_dataloaders(
 
     return train_loader, val_loader, test_loader
 
+def infer_n_frames(sequences_dir: str) -> int:
+    """
+    Inspect one .npy file in sequences_dir to determine the frame count
+    for this configuration. Used to set ModelConfig.n_frames correctly
+    before building the model, since frame count varies by offset/duration.
+
+    Parameters
+    ----------
+    sequences_dir : str — path to a config's sequences/ folder
+
+    Returns
+    -------
+    int — number of frames (first dimension) in the sequences
+    """
+    files = [f for f in os.listdir(sequences_dir) if f.endswith('.npy')]
+    if not files:
+        raise ValueError(f'No .npy files found in {sequences_dir}')
+
+    sample = np.load(os.path.join(sequences_dir, files[0]))
+    return sample.shape[0]
+
 
 # ---------------------------------------------------------------------------
 # Self-test — run directly to verify dataset loads correctly
@@ -397,8 +418,8 @@ def make_dataloaders(
 if __name__ == '__main__':
     import sys
 
-    sequences_dir = sys.argv[1] if len(sys.argv) > 1 else 'data/processed/sequences'
-    metadata_path = sys.argv[2] if len(sys.argv) > 2 else 'data/processed/metadata.csv'
+    sequences_dir = sys.argv[1] if len(sys.argv) > 1 else 'data/processed/offset0_dur30/sequences'
+    metadata_path = sys.argv[2] if len(sys.argv) > 2 else 'data/processed/offset0_dur30/metadata.csv'
 
     print('=== SeizureDataset self-test ===\n')
 
@@ -413,7 +434,7 @@ if __name__ == '__main__':
 
     print('\n--- Inspecting one training batch ---')
     seqs, labels = next(iter(train_loader))
-    print(f'Sequence batch shape : {seqs.shape}')   # (4, 360, 5, 17)
+    print(f'Sequence batch shape : {seqs.shape}')   # (4, n_frames, 5, 17) — n_frames varies by config
     print(f'Label batch shape    : {labels.shape}') # (4,)
     print(f'Label values         : {labels}')
     print(f'Sequence dtype       : {seqs.dtype}')

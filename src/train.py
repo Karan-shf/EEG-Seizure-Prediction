@@ -39,7 +39,7 @@ from sklearn.metrics import roc_auc_score
 # Make src/ importable when run directly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dataset import SeizureDataset, get_splits, make_dataloaders
+from dataset import SeizureDataset, get_splits, make_dataloaders, infer_n_frames
 from model import SeizurePredictor, ModelConfig, model_summary
 from logger import get_logger
 
@@ -50,12 +50,25 @@ logger = get_logger(name='train')
 # ---------------------------------------------------------------------------
 
 class TrainConfig:
-    # Paths
-    metadata_path  = 'data/processed/metadata.csv'
-    sequences_dir  = 'data/processed/sequences'
-    checkpoint_dir = 'experiments/checkpoints'
-    log_dir        = 'experiments/logs'
-    results_dir    = 'experiments/results'
+    
+    def __init__(
+        self,
+        metadata_path: str = 'data/processed/offset0_dur30/metadata.csv',
+        sequences_dir: str = 'data/processed/offset0_dur30/sequences',
+        config_name: str = 'offset0_dur30',
+        checkpoint_dir: str = 'experiments/checkpoints',
+        log_dir: str = 'experiments/logs',
+        results_dir: str = 'experiments/results',
+    ):
+        self.metadata_path  = metadata_path
+        self.sequences_dir  = sequences_dir
+        self.config_name    = config_name
+
+        # Namespace checkpoint/results by config_name so 16 runs
+        # never overwrite each other
+        self.checkpoint_dir = os.path.join(checkpoint_dir, config_name)
+        self.log_dir        = os.path.join(log_dir, config_name)
+        self.results_dir    = os.path.join(results_dir, config_name)
 
     # Split strategy: 'fixed' for development, 'lopo' for final publication
     split_strategy = 'fixed'
@@ -279,6 +292,17 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     train_cfg : TrainConfig — paths, epochs, lr, etc.
     model_cfg : ModelConfig — model hyperparameters
     """
+    # Infer n_frames from actual saved sequences for this config,
+    # rather than assuming a fixed value — critical for the grid search
+    # where each (offset, duration) combination has a different frame count
+    inferred_n_frames = infer_n_frames(train_cfg.sequences_dir)
+
+    if model_cfg.n_frames != inferred_n_frames:
+        logger.info(f'[Train] Overriding model_cfg.n_frames: '
+              f'{model_cfg.n_frames} → {inferred_n_frames} '
+              f'(inferred from {train_cfg.sequences_dir})')
+        model_cfg.n_frames = inferred_n_frames
+
     set_seed(train_cfg.seed)
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(train_cfg.log_dir,        exist_ok=True)
@@ -405,7 +429,14 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     curves_path = os.path.join(train_cfg.results_dir, 'training_curves.png')
     plot_training_curves(history, curves_path)
 
-    return model, best_val_auc, history
+    return {
+        'config_name':   train_cfg.config_name,
+        'model':         model,
+        'best_val_auc':  best_val_auc,
+        'best_epoch':    best_epoch,
+        'history':       history,
+        'checkpoint_path': checkpoint_path,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +457,7 @@ if __name__ == '__main__':
     logger.info(f'Early stopping : patience={train_cfg.patience}')
     logger.info(f'Device         : {train_cfg.device}')
 
-    model, best_auc, history = train(train_cfg, model_cfg)
+    result = train(train_cfg, model_cfg)
 
-    logger.info(f'\nFinal best validation AUC: {best_auc:.4f}')
+    logger.info(f'\nFinal best validation AUC: {result["best_val_auc"]:.4f}')
     logger.info('Run evaluate.py next to test on held-out patients.')

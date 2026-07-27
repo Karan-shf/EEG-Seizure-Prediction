@@ -62,10 +62,12 @@ logger = get_logger(name='evaluate')
 # Configuration
 # ---------------------------------------------------------------------------
 
-METADATA_PATH   = 'data/processed/metadata.csv'
-SEQUENCES_DIR   = 'data/processed/sequences'
-CHECKPOINT_PATH = 'experiments/checkpoints/best_model.pt'
-OUTPUT_DIR      = 'experiments/results/evaluation'
+# Defaults used only when evaluate.py is run standalone.
+# The grid runner passes these explicitly per configuration.
+DEFAULT_METADATA_PATH   = 'data/processed/offset0_dur30/metadata.csv'
+DEFAULT_SEQUENCES_DIR   = 'data/processed/offset0_dur30/sequences'
+DEFAULT_CHECKPOINT_PATH = 'experiments/checkpoints/offset0_dur30/best_model.pt'
+DEFAULT_OUTPUT_DIR      = 'experiments/results/offset0_dur30/evaluation'
 
 # Classification threshold — sequences with P(preictal) >= this are
 # predicted as preictal. 0.5 is standard; tuning this trades sensitivity
@@ -535,22 +537,41 @@ def print_report(metrics: dict, per_patient: pd.DataFrame,
 # Main
 # ---------------------------------------------------------------------------
 
-def evaluate():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def evaluate(
+    metadata_path: str = DEFAULT_METADATA_PATH,
+    sequences_dir: str = DEFAULT_SEQUENCES_DIR,
+    checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+    threshold: float = THRESHOLD,
+    config_name: str | None = None,
+):
+    """
+    Parameters
+    ----------
+    metadata_path   : str — path to this config's metadata.csv
+    sequences_dir   : str — path to this config's sequences/ folder
+    checkpoint_path : str — path to this config's trained model
+    output_dir      : str — where to save evaluation outputs
+    threshold       : float — classification threshold
+    config_name     : str — label for this run, used in printed report
+    """
+    os.makedirs(output_dir, exist_ok=True)
     device = torch.device(DEVICE)
     logger.info(f'[Evaluate] Device: {device}')
+    if config_name:
+        print(f'[Evaluate] Config: {config_name}')
 
     # --- Load model ---
-    model = load_model(CHECKPOINT_PATH)
+    model = load_model(checkpoint_path)
     model = model.to(device)
 
     # --- Build test DataLoader ---
-    meta  = pd.read_csv(METADATA_PATH)
+    meta  = pd.read_csv(metadata_path)
     folds = get_splits(meta, strategy='fixed')
     train_p, val_p, test_p = folds[0]
 
     _, _, test_loader = make_dataloaders(
-        meta, SEQUENCES_DIR,
+        meta, sequences_dir,
         train_p, val_p, test_p,
         batch_size=16,
         num_workers=0,
@@ -563,46 +584,52 @@ def evaluate():
     results = run_inference(model, test_loader, device)
 
     # --- Metrics ---
-    metrics     = compute_metrics(results['probas'], results['labels'])
-    per_patient = compute_per_patient_metrics(results)
+    metrics     = compute_metrics(results['probas'], results['labels'], threshold=threshold)
+    per_patient = compute_per_patient_metrics(results, threshold=threshold)
 
     # --- Print report ---
-    print_report(metrics, per_patient, CHECKPOINT_PATH)
+    print_report(metrics, per_patient, checkpoint_path)
 
     # --- Save metrics as JSON ---
     metrics_save = {k: v for k, v in metrics.items()
                     if k not in ('roc_fpr', 'roc_tpr', 'roc_thresholds')}
-    metrics_path = os.path.join(OUTPUT_DIR, 'metrics.json')
+    metrics_path = os.path.join(output_dir, 'metrics.json')
     with open(metrics_path, 'w') as f:
         json.dump(metrics_save, f, indent=2)
     logger.info(f'\nMetrics saved to {metrics_path}')
 
     # --- Save per-patient table ---
-    table_path = os.path.join(OUTPUT_DIR, 'per_patient_metrics.csv')
+    table_path = os.path.join(output_dir, 'per_patient_metrics.csv')
     per_patient.to_csv(table_path, index=False)
     logger.info(f'Per-patient table saved to {table_path}')
 
     # --- Plots ---
     plot_roc_curve(
         metrics,
-        os.path.join(OUTPUT_DIR, 'roc_curve.png')
+        os.path.join(output_dir, 'roc_curve.png')
     )
     plot_confusion_matrix(
         metrics,
-        os.path.join(OUTPUT_DIR, 'confusion_matrix.png')
+        os.path.join(output_dir, 'confusion_matrix.png')
     )
     plot_attention_heatmap(
         results,
-        os.path.join(OUTPUT_DIR, 'attention_heatmap.png')
+        os.path.join(output_dir, 'attention_heatmap.png')
     )
     plot_mean_attention(
         results,
-        os.path.join(OUTPUT_DIR, 'mean_attention.png')
+        os.path.join(output_dir, 'mean_attention.png')
     )
 
-    logger.info(f'\n[Evaluate] All outputs saved to {OUTPUT_DIR}/')
-    return metrics, per_patient, results
+    logger.info(f'\n[Evaluate] All outputs saved to {output_dir}/')
+    return {
+        'config_name': config_name,
+        'metrics':     metrics,
+        'per_patient': per_patient,
+        'results':     results,
+        'output_dir':  output_dir,
+    }
 
 
 if __name__ == '__main__':
-    evaluate()
+    evaluate(config_name='offset0_dur30')

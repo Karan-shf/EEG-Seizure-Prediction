@@ -74,7 +74,10 @@ class ModelConfig:
         model  = SeizurePredictor(config)
     """
     # Input dimensions — must match dataset.py constants
-    n_frames:   int = 599
+    n_frames: int = 0   # MUST be set explicitly per experiment via
+                        # infer_n_frames(sequences_dir) — no longer
+                        # a fixed value since duration varies across
+                        # the offset/duration grid search
     n_bands:    int = 5
     n_channels: int = 17
 
