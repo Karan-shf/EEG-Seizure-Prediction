@@ -222,6 +222,7 @@ class SeizureDataset(Dataset):
         # This simulates the model seeing different starting points
         # and prevents it from over-relying on absolute frame position.
         if self.augment:
+            # --- Time-shift augmentation ---
             shift = np.random.randint(-18, 18)   # ± 3 minutes (18 × 5s windows)
             seq   = np.roll(seq, shift, axis=0)
 
@@ -230,6 +231,26 @@ class SeizureDataset(Dataset):
                 seq[:shift] = 0.0
             elif shift < 0:
                 seq[shift:] = 0.0
+
+            # --- Gaussian noise injection ---
+            # Adds small random noise scaled to each sequence's own std,
+            # simulating natural measurement noise in EEG recordings.
+            # Only applied to non-padded (real) frames.
+            non_zero_mask = seq.sum(axis=(1, 2)) != 0
+            if non_zero_mask.sum() > 0:
+                noise_std = seq[non_zero_mask].std() * 0.05   # 5% of signal std
+                noise = np.random.normal(0, noise_std, size=seq.shape).astype(np.float32)
+                seq[non_zero_mask] += noise[non_zero_mask]
+
+            # --- Channel dropout ---
+            # Randomly zero out 1-2 channels across the entire sequence.
+            # Forces the model to not over-rely on any single electrode,
+            # improving robustness to electrode artifacts or disconnections.
+            n_channels = seq.shape[2]
+            n_drop = np.random.choice([0, 1, 2], p=[0.5, 0.35, 0.15])  # usually 0-1 dropped
+            if n_drop > 0:
+                drop_channels = np.random.choice(n_channels, size=n_drop, replace=False)
+                seq[:, :, drop_channels] = 0.0
 
         # --- Instance normalisation (per channel per band) ---
         # For each of the 17 channels and each of the 5 bands,

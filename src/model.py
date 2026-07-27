@@ -55,6 +55,7 @@ logits, attn_weights = model(x)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from dataclasses import dataclass
 
 
@@ -160,6 +161,55 @@ class CNNBlock(nn.Module):
         x = F.relu(self.bn3(self.fc(x)))       # (batch, 128)
         return x
 
+# ---------------------------------------------------------------------------
+# Positional Encoding
+# ---------------------------------------------------------------------------
+
+class PositionalEncoding(nn.Module):
+    """
+    Sinusoidal positional encoding, added to CNN frame features before
+    they enter the LSTM.
+
+    Gives the model explicit information about each frame's position in
+    the 30-minute sequence — e.g. frame 50 (early) vs frame 550 (near
+    seizure onset) become distinguishable even if their band power
+    values happen to look similar.
+
+    Uses the standard fixed sin/cos encoding from Vaswani et al. (2017),
+    not learned — this means it generalises to any sequence length
+    without needing extra training data.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 1000):
+        super().__init__()
+
+        # Precompute the encoding matrix once at initialisation
+        position = torch.arange(max_len).unsqueeze(1).float()       # (max_len, 1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() *
+            (-np.log(10000.0) / d_model)
+        )
+
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)   # (1, max_len, d_model) — batch dim for broadcasting
+
+        # register_buffer: saved with the model but not trained
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : (batch, n_frames, d_model) — CNN output sequence
+
+        Returns
+        -------
+        (batch, n_frames, d_model) — x with positional encoding added
+        """
+        n_frames = x.size(1)
+        return x + self.pe[:, :n_frames, :]
 
 # ---------------------------------------------------------------------------
 # Additive Attention (Bahdanau-style)
@@ -252,6 +302,12 @@ class SeizurePredictor(nn.Module):
         # Stage 1: CNN spatial feature extractor
         self.cnn = CNNBlock(config)
 
+        # Stage 1.5: Apply positional encoding
+        self.pos_encoding = PositionalEncoding(
+            d_model=config.cnn_output,
+            max_len=config.n_frames + 10,   # small buffer above expected length
+        )
+
         # Stage 2: LSTM temporal reasoner
         self.lstm = nn.LSTM(
             input_size=config.cnn_output,    # 128 — CNN output size
@@ -300,6 +356,8 @@ class SeizurePredictor(nn.Module):
 
         # Restore sequence structure
         cnn_out = cnn_out.view(batch_size, n_frames, -1)  # (batch, frames, 128)
+
+        cnn_out = self.pos_encoding(cnn_out)
 
         # --- Stage 2: LSTM ---
         lstm_out, _ = self.lstm(cnn_out)    # (batch, frames, lstm_hidden=256)

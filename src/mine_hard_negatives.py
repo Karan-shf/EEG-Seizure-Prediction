@@ -220,7 +220,8 @@ def is_safe_anchor(
             return False
 
     for existing in existing_anchors:
-        if abs(anchor - existing) < PRE_ICTAL_SECS:
+        # if abs(anchor - existing) < PRE_ICTAL_SECS:
+        if abs(anchor - existing) < 300:
             return False
 
     return True
@@ -266,13 +267,19 @@ def mine_neighbours_for_sequence(
         (meta['source_edf'] == source_edf)
     ]['anchor_sec'].tolist()
 
-    # Generate candidate neighbour anchors at ±30, ±60, ±90 min offsets
     step          = PRE_ICTAL_SECS   # 30 minutes
     candidates    = []
+    print(f'    anchor_sec={anchor_sec:.0f}s, recording_duration={recording_duration:.0f}s')
     for multiplier in [1, -1, 2, -2, 3, -3]:
         candidate = anchor_sec + multiplier * step
-        if 0 < candidate <= recording_duration:
+        in_bounds = 0 < candidate <= recording_duration
+        print(f'    multiplier={multiplier:+d} → candidate={candidate:.0f}s '
+            f'{"[OK]" if in_bounds else "[OUT OF BOUNDS]"}')
+        if in_bounds:
             candidates.append(candidate)
+
+    if not candidates:
+        print(f'    → No valid candidates within recording bounds. Skipping.')
 
     saved_rows = []
     found      = 0
@@ -282,6 +289,8 @@ def mine_neighbours_for_sequence(
             break
 
         if not is_safe_anchor(candidate, seizure_onsets, existing_file_anchors):
+            print(f'    [rejected] candidate={candidate:.0f}s — '
+                f'too close to seizure or existing anchor')
             continue
 
         # Extract sequence

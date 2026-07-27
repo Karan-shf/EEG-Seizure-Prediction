@@ -71,7 +71,8 @@ OUTPUT_DIR      = 'experiments/results/evaluation'
 # predicted as preictal. 0.5 is standard; tuning this trades sensitivity
 # for specificity. We report metrics at 0.5 but also plot the full ROC curve
 # so readers can see the tradeoff at any threshold.
-THRESHOLD = 0.5
+# THRESHOLD = 0.5
+THRESHOLD = 0.35
 
 # Window duration in seconds — used to compute FPR/h
 WINDOW_SECONDS = 5

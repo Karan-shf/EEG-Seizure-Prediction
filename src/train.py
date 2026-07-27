@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from sklearn.metrics import roc_auc_score
 
 # Make src/ importable when run directly
@@ -317,14 +317,14 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
         weight_decay=train_cfg.weight_decay,
     )
 
-    # --- LR scheduler ---
-    scheduler = ReduceLROnPlateau(
+    # Cosine annealing with warm restarts: LR smoothly decreases following
+    # a cosine curve, then "restarts" to a higher value periodically.
+    # This helps escape local minima that plateau-based scheduling can get stuck in.
+    scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        mode='max',              # maximise val AUC
-        factor=train_cfg.lr_factor,
-        patience=train_cfg.lr_patience,
-        min_lr=train_cfg.min_lr,
-        verbose=True,
+        T_0=10,          # epochs until first restart
+        T_mult=2,        # each restart cycle doubles in length (10, 20, 40, ...)
+        eta_min=train_cfg.min_lr,
     )
 
     # --- Training state ---
@@ -356,7 +356,9 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
             model, val_loader, criterion, device
         )
 
-        scheduler.step(val_auc)
+        # CosineAnnealingWarmRestarts steps every epoch based on epoch count,
+        # not validation metric (unlike ReduceLROnPlateau)
+        scheduler.step(epoch)
         current_lr = optimizer.param_groups[0]['lr']
 
         # Record history
