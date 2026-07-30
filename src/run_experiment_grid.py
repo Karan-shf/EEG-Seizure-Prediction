@@ -63,7 +63,7 @@ HEATMAP_PATH     = os.path.join(RESULTS_ROOT, 'grid_search_heatmap.png')
 
 # Set to a small number (e.g. 5) for a fast pilot run to sanity-check
 # the whole pipeline before committing to the full grid.
-MAX_EPOCHS_OVERRIDE = 4   # None = use TrainConfig default (100)
+MAX_EPOCHS_OVERRIDE = 5   # None = use TrainConfig default (100)
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,7 @@ def run_one_config(offset_minutes: int, duration_minutes: int) -> dict:
             'config_name':      config_name,
             'offset_minutes':   offset_minutes,
             'duration_minutes': duration_minutes,
-            'status':           'success',
+            'status':           'success' if train_result['data_adequate'] else 'success_low_data',
             'elapsed_minutes':  round(elapsed / 60, 1),
             'n_preictal':       build_info['n_preictal'],
             'n_interictal':     build_info['n_interictal'],
@@ -156,6 +156,8 @@ def run_one_config(offset_minutes: int, duration_minutes: int) -> dict:
             'test_specificity': metrics['specificity'],
             'test_f1':          metrics['f1'],
             'test_fpr_per_hour': metrics['fpr_per_hour'],
+            'data_adequate':    train_result['data_adequate'],
+            'n_train_sequences': train_result['n_train_sequences'],
         }
 
     except Exception as e:
@@ -214,18 +216,31 @@ def plot_heatmap(df: pd.DataFrame, save_path: str):
 
     ax.set_xlabel('Offset before seizure onset', fontsize=12)
     ax.set_ylabel('Window duration', fontsize=12)
-    ax.set_title('Test AUC — Window Configuration Grid Search', fontsize=13)
+    # ax.set_title('Test AUC — Window Configuration Grid Search', fontsize=13)
+    ax.set_title('Test AUC — Window Configuration Grid Search\n'
+             '(* = trained on insufficient data, interpret with caution)',
+             fontsize=12)
 
     # Annotate each cell with its AUC value
     for i in range(len(GRID_DURATIONS)):
         for j in range(len(GRID_OFFSETS)):
             val = pivot.values[i, j]
             if not np.isnan(val):
-                ax.text(j, i, f'{val:.3f}', ha='center', va='center',
+                # Check if this cell corresponds to a low-data config
+                cell_row = successful[
+                    (successful['duration_minutes'] == GRID_DURATIONS[i]) &
+                    (successful['offset_minutes']   == GRID_OFFSETS[j])
+                ]
+                is_low_data = (
+                    len(cell_row) > 0 and
+                    cell_row.iloc[0].get('status') == 'success_low_data'
+                )
+                label = f'{val:.3f}*' if is_low_data else f'{val:.3f}'
+                ax.text(j, i, label, ha='center', va='center',
                         fontsize=11, fontweight='bold',
                         color='white' if val < 0.65 or val > 0.9 else 'black')
             else:
-                ax.text(j, i, 'FAILED', ha='center', va='center',
+                ax.text(j, i, 'N/A', ha='center', va='center',
                         fontsize=9, color='gray')
 
     plt.colorbar(im, ax=ax, label='Test AUC')

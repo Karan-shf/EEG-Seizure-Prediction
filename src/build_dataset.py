@@ -76,7 +76,7 @@ def find_interictal_anchors(
     seizure_onsets: list,
     min_gap: int = INTERICTAL_MIN_GAP,
     n_anchors: int = MAX_INTERICTAL_PER_PATIENT,
-    window_needed: float = PRE_ICTAL_SECS,
+    window_needed: float | None = None,   # must be passed explicitly,
 ) -> list:
     """
     Find up to n_anchors time points within a recording that are at least
@@ -95,6 +95,11 @@ def find_interictal_anchors(
     -------
     list of float anchor times (end of interictal window = anchor)
     """
+    if window_needed is None:
+        raise ValueError(
+            'window_needed must be explicitly passed as offset_sec + duration_sec'
+        )
+    
     anchors = []
 
     # Candidate anchor points: every 30-minute mark through the recording
@@ -209,7 +214,12 @@ def process_interictal_events(
         logger.info(f'  [ERROR reading {filename} for interictal] {e}')
         return rows
 
-    anchors = find_interictal_anchors(raw_duration, seizure_onsets, n_anchors=1)
+    anchors = find_interictal_anchors(
+        raw_duration, 
+        seizure_onsets, 
+        n_anchors=1, 
+        window_needed=offset_sec + duration_sec
+    )
 
     if not anchors:
         logger.info(f'  [NO INTERICTAL] {patient_id} {filename} — no safe window found')

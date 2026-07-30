@@ -321,13 +321,45 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     folds  = get_splits(meta, strategy=train_cfg.split_strategy)
     train_p, val_p, test_p = folds[0]   # fold 0 for fixed; loop over folds for LOPO
 
-    train_loader, val_loader, _ = make_dataloaders(
+    # Adaptive batch size: shrink if the training set is too small to form
+    # even one full batch with drop_last=True. Never go below batch_size=2
+    # (batch_size=1 breaks BatchNorm in the CNN).
+    train_meta = meta[meta['patient_id'].isin(train_p)]
+    n_train_sequences = len(train_meta)
+
+    effective_batch_size = train_cfg.batch_size
+    if n_train_sequences < train_cfg.batch_size * 2:
+        effective_batch_size = max(2, n_train_sequences // 2)
+        logger.info(
+            f'[Train] Small dataset detected ({n_train_sequences} training '
+            f'sequences). Reducing batch_size {train_cfg.batch_size} → '
+            f'{effective_batch_size} to avoid empty DataLoader.'
+        )
+
+    train_loader, val_loader, test_loader = make_dataloaders(
         meta,
         train_cfg.sequences_dir,
         train_p, val_p, test_p,
-        batch_size=train_cfg.batch_size,
+        batch_size=effective_batch_size,
         num_workers=0,
     )
+
+    # Guard against folds with too little data to form even one batch
+    if len(train_loader) == 0:
+        logger.info(
+            f'[Train] SKIPPING — training set has {len(train_loader.dataset)} '
+            f'sequences, fewer than batch_size={train_cfg.batch_size}. '
+            f'Cannot form a single batch with drop_last=True.'
+        )
+        return {
+            'config_name':      train_cfg.config_name,
+            'model':            None,
+            'best_val_auc':     float('nan'),
+            'best_epoch':       0,
+            'history':          {},
+            'checkpoint_path':  None,
+            'status':           'insufficient_data',
+        }
 
     # --- Model ---
     model = SeizurePredictor(model_cfg).to(device)
@@ -434,13 +466,37 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     curves_path = os.path.join(train_cfg.results_dir, 'training_curves.png')
     plot_training_curves(history, curves_path, logger)
 
+    # Flag configs with thin data so downstream comparison isn't misleading.
+    # Threshold: fewer than 20 total training sequences, or fewer than 3
+    # sequences in either class, is considered data-starved for this
+    # architecture and dataset.
+    train_preictal   = int((train_meta['label'] == 1).sum())
+    train_interictal = int((train_meta['label'] == 0).sum())
+
+    data_adequate = (
+        n_train_sequences >= 20 and
+        train_preictal   >= 3 and
+        train_interictal >= 3
+    )
+
+    if not data_adequate:
+        logger.info(
+            f'[Train] WARNING — data adequacy flag: INSUFFICIENT. '
+            f'train_sequences={n_train_sequences} '
+            f'(preictal={train_preictal}, interictal={train_interictal}). '
+            f'Results for this config should be interpreted with caution.'
+        )
+
     return {
-        'config_name':   train_cfg.config_name,
-        'model':         model,
-        'best_val_auc':  best_val_auc,
-        'best_epoch':    best_epoch,
-        'history':       history,
-        'checkpoint_path': checkpoint_path,
+        'config_name':      train_cfg.config_name,
+        'model':            model,
+        'best_val_auc':     best_val_auc,
+        'best_epoch':       best_epoch,
+        'history':          history,
+        'checkpoint_path':  checkpoint_path,
+        'data_adequate':    data_adequate,
+        'n_train_sequences': n_train_sequences,
+        'effective_batch_size': effective_batch_size,
     }
 
 
