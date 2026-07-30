@@ -63,7 +63,7 @@ HEATMAP_PATH     = os.path.join(RESULTS_ROOT, 'grid_search_heatmap.png')
 
 # Set to a small number (e.g. 5) for a fast pilot run to sanity-check
 # the whole pipeline before committing to the full grid.
-MAX_EPOCHS_OVERRIDE = None   # None = use TrainConfig default (100)
+MAX_EPOCHS_OVERRIDE = 4   # None = use TrainConfig default (100)
 
 
 # ---------------------------------------------------------------------------
@@ -310,4 +310,5 @@ def run_grid_search():
 
 
 if __name__ == '__main__':
-    run_grid_search()
+    # run_grid_search()
+    run_one_config(offset_minutes=30, duration_minutes=15)

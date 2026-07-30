@@ -99,7 +99,7 @@ def parse_patient_summary(summary_path: str) -> dict:
     return result
 
 
-def parse_all_summaries(chbmit_root: str) -> dict:
+def parse_all_summaries(chbmit_root: str, logger) -> dict:
     """
     Walk the CHB-MIT root directory and parse every patient's summary file.
 
@@ -140,7 +140,10 @@ def parse_all_summaries(chbmit_root: str) -> dict:
                 break
 
         if summary_file is None:
-            print(f'[WARNING] No summary file found for {patient_id} — skipping.')
+            if logger:
+                logger.info(f'[WARNING] No summary file found for {patient_id} — skipping.')
+            else:
+                print(f'[WARNING] No summary file found for {patient_id} — skipping.')
             continue
 
         patient_data = parse_patient_summary(summary_file)
@@ -149,11 +152,19 @@ def parse_all_summaries(chbmit_root: str) -> dict:
         # Report what was found
         total_seizures = sum(len(v) for v in patient_data.values())
         files_with_seizures = sum(1 for v in patient_data.values() if len(v) > 0)
-        print(f'[{patient_id}] {len(patient_data)} recording files | '
-              f'{files_with_seizures} with seizures | '
-              f'{total_seizures} seizure events total')
+        if logger:
+            logger.info(f'[{patient_id}] {len(patient_data)} recording files | '
+                f'{files_with_seizures} with seizures | '
+                f'{total_seizures} seizure events total')
+        else:
+            print(f'[{patient_id}] {len(patient_data)} recording files | '
+                f'{files_with_seizures} with seizures | '
+                f'{total_seizures} seizure events total')
 
-    print(f'\nDone. Parsed {len(all_patients)} patients.')
+    if logger:
+        logger.info(f'\nDone. Parsed {len(all_patients)} patients.')
+    else:
+        print(f'\nDone. Parsed {len(all_patients)} patients.')
     return all_patients
 
 
@@ -198,7 +209,7 @@ if __name__ == '__main__':
     root = sys.argv[1] if len(sys.argv) > 1 else 'data/raw/chb-mit'
     print(f'Parsing summaries in: {root}\n')
 
-    index = parse_all_summaries(root)
+    index = parse_all_summaries(root, None)
     events = get_all_seizure_events(index)
 
     print(f'\nTotal seizure events across all patients: {len(events)}')

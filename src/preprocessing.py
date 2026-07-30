@@ -20,6 +20,21 @@ from src.preprocessing import load_and_filter, extract_segment, compute_sequence
 import numpy as np
 import mne
 from scipy.signal import welch
+import warnings
+
+# Suppress known-harmless MNE warnings about duplicate/unlabeled channels
+# in CHB-MIT files. These channels are excluded later by the N_CHANNELS
+# restriction in dataset.py, so the warnings carry no actionable information.
+warnings.filterwarnings(
+    'ignore',
+    message='Channel names are not unique.*',
+    category=RuntimeWarning,
+)
+warnings.filterwarnings(
+    'ignore',
+    message='Scaling factor is not defined.*',
+    category=RuntimeWarning,
+)
 
 
 # ---------------------------------------------------------------------------

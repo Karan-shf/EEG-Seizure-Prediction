@@ -129,6 +129,7 @@ def process_preictal_event(
     offset_sec: float,
     duration_sec: float,
     target_frames: int,
+    logger
 ) -> dict | None:
     """
     Extract a pre-ictal sequence for one seizure event and save it.
@@ -139,7 +140,7 @@ def process_preictal_event(
     save_path = os.path.join(output_dir, save_name)
 
     if os.path.exists(save_path):
-        print(f'  [SKIP — already exists] {save_name}')
+        logger.info(f'  [SKIP — already exists] {save_name}')
         # Still return metadata so it appears in the CSV
         seq = np.load(save_path)
         return _make_metadata_row(
@@ -156,7 +157,7 @@ def process_preictal_event(
             target_n_windows=target_frames,
         )
         np.save(save_path, sequence)
-        print(f'  [SAVED] {save_name}  shape={sequence.shape}  sfreq={sfreq}')
+        logger.info(f'  [SAVED] {save_name}  shape={sequence.shape}  sfreq={sfreq}')
 
         # Count how many leading frames are zero-padded
         non_zero_frames = int(np.any(sequence != 0, axis=(1, 2)).sum())
@@ -169,11 +170,11 @@ def process_preictal_event(
         )
 
     except ValueError as e:
-        print(f'  [SKIP] {patient_id} {filename} onset={onset}s — {e}')
+        logger.info(f'  [SKIP] {patient_id} {filename} onset={onset}s — {e}')
         return None
 
     except Exception as e:
-        print(f'  [ERROR] {patient_id} {filename} onset={onset}s — {e}')
+        logger.info(f'  [ERROR] {patient_id} {filename} onset={onset}s — {e}')
         return None
 
 
@@ -191,6 +192,7 @@ def process_interictal_events(
     offset_sec: float,
     duration_sec: float,
     target_frames: int,
+    logger
 ) -> list:
     """
     Extract interictal sequences from a recording file and save them.
@@ -204,13 +206,13 @@ def process_interictal_events(
         raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
         raw_duration = raw.times[-1]
     except Exception as e:
-        print(f'  [ERROR reading {filename} for interictal] {e}')
+        logger.info(f'  [ERROR reading {filename} for interictal] {e}')
         return rows
 
     anchors = find_interictal_anchors(raw_duration, seizure_onsets, n_anchors=1)
 
     if not anchors:
-        print(f'  [NO INTERICTAL] {patient_id} {filename} — no safe window found')
+        logger.info(f'  [NO INTERICTAL] {patient_id} {filename} — no safe window found')
         return rows
 
     for anchor in anchors:
@@ -220,7 +222,7 @@ def process_interictal_events(
         save_path = os.path.join(output_dir, save_name)
 
         if os.path.exists(save_path):
-            print(f'  [SKIP — already exists] {save_name}')
+            logger.info(f'  [SKIP — already exists] {save_name}')
             seq = np.load(save_path)
             rows.append(_make_metadata_row(
                 save_name, patient_id, filename, 'interictal', 0,
@@ -237,7 +239,7 @@ def process_interictal_events(
                 target_n_windows=target_frames,
             )
             np.save(save_path, sequence)
-            print(f'  [SAVED] {save_name}  shape={sequence.shape}')
+            logger.info(f'  [SAVED] {save_name}  shape={sequence.shape}')
 
             rows.append(_make_metadata_row(
                 save_name, patient_id, filename, 'interictal', 0,
@@ -245,7 +247,7 @@ def process_interictal_events(
             ))
 
         except Exception as e:
-            print(f'  [ERROR] interictal {patient_id} {filename} anchor={anchor}s — {e}')
+            logger.info(f'  [ERROR] interictal {patient_id} {filename} anchor={anchor}s — {e}')
 
     return rows
 
@@ -300,8 +302,16 @@ def build_dataset(
     {output_root}/{config_name}/sequences/*.npy
     {output_root}/{config_name}/metadata.csv
     """
+
+    from logger import get_logger
+
     if config_name is None:
         config_name = f'offset{int(offset_minutes)}_dur{int(duration_minutes)}'
+
+    logger = get_logger(
+        name=f'{config_name}_dataset',
+        log_dir=os.path.join('experiments', 'logs', config_name or 'default'),
+    )
 
     output_dir    = os.path.join(output_root, config_name, 'sequences')
     metadata_path = os.path.join(output_root, config_name, 'metadata.csv')
@@ -319,28 +329,28 @@ def build_dataset(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print('=' * 60)
-    print(f'SeizureHorizon — Dataset Builder — [{config_name}]')
-    print('=' * 60)
-    print(f'CHB-MIT root   : {CHBMIT_ROOT}')
-    print(f'Output dir     : {output_dir}')
-    print(f'Metadata file  : {metadata_path}')
-    print(f'Offset         : {offset_minutes} min ({offset_sec:.0f}s)')
-    print(f'Duration       : {duration_minutes} min ({duration_sec:.0f}s)')
-    print(f'Target frames  : {target_frames}')
-    print()
+    logger.info('=' * 60)
+    logger.info(f'SeizureHorizon — Dataset Builder — [{config_name}]')
+    logger.info('=' * 60)
+    logger.info(f'CHB-MIT root   : {CHBMIT_ROOT}')
+    logger.info(f'Output dir     : {output_dir}')
+    logger.info(f'Metadata file  : {metadata_path}')
+    logger.info(f'Offset         : {offset_minutes} min ({offset_sec:.0f}s)')
+    logger.info(f'Duration       : {duration_minutes} min ({duration_sec:.0f}s)')
+    logger.info(f'Target frames  : {target_frames}')
+    logger.info('')
 
-    print('Step 1: Parsing summary files...')
-    seizure_index = parse_all_summaries(CHBMIT_ROOT)
+    logger.info('Step 1: Parsing summary files...')
+    seizure_index = parse_all_summaries(CHBMIT_ROOT, logger)
     all_events    = get_all_seizure_events(seizure_index)
-    print(f'\nTotal seizure events found: {len(all_events)}\n')
+    logger.info(f'\nTotal seizure events found: {len(all_events)}\n')
 
     metadata_rows = []
 
     for patient_id, patient_data in sorted(seizure_index.items()):
-        print(f'\n{"─" * 50}')
-        print(f'Patient: {patient_id}')
-        print(f'{"─" * 50}')
+        logger.info(f'\n{"─" * 50}')
+        logger.info(f'Patient: {patient_id}')
+        logger.info(f'{"─" * 50}')
 
         patient_dir    = os.path.join(CHBMIT_ROOT, patient_id)
         seizure_times  = get_patient_seizure_times(patient_data)
@@ -354,10 +364,10 @@ def build_dataset(
 
             edf_path = os.path.join(patient_dir, filename)
             if not os.path.exists(edf_path):
-                print(f'  [MISSING EDF] {edf_path}')
+                logger.info(f'  [MISSING EDF] {edf_path}')
                 continue
 
-            print(f'\n  File: {filename}')
+            logger.info(f'\n  File: {filename}')
             prev_offset = None
 
             for sz in sorted(seizures, key=lambda x: x['onset']):
@@ -367,7 +377,7 @@ def build_dataset(
                 # Skip if too close to previous seizure given this window's reach
                 min_gap_needed = offset_sec + duration_sec
                 if prev_offset is not None and onset - prev_offset < min_gap_needed:
-                    print(f'  [SKIP — too close to previous seizure] '
+                    logger.info(f'  [SKIP — too close to previous seizure] '
                           f'onset={onset}s, prev_offset={prev_offset}s')
                     prev_offset = offset
                     continue
@@ -378,6 +388,7 @@ def build_dataset(
                     offset_sec=offset_sec,
                     duration_sec=duration_sec,
                     target_frames=target_frames,
+                    logger=logger
                 )
                 if row:
                     metadata_rows.append(row)
@@ -400,12 +411,13 @@ def build_dataset(
                 offset_sec=offset_sec,
                 duration_sec=duration_sec,
                 target_frames=target_frames,
+                logger=logger
             )
             metadata_rows.extend(inter_rows)
 
     # --- Write metadata CSV ---
-    print(f'\n{"=" * 60}')
-    print(f'Writing metadata to {metadata_path} ...')
+    logger.info(f'\n{"=" * 60}')
+    logger.info(f'Writing metadata to {metadata_path} ...')
 
     fieldnames = [
         'filename', 'patient_id', 'source_edf', 'type', 'label',
@@ -421,13 +433,13 @@ def build_dataset(
     interictal_rows = [r for r in metadata_rows if r['label'] == 0]
     patients_done   = len(set(r['patient_id'] for r in metadata_rows))
 
-    print(f'\nDataset summary [{config_name}]')
-    print(f'  Patients processed  : {patients_done}')
-    print(f'  Pre-ictal sequences : {len(preictal_rows)}')
-    print(f'  Interictal sequences: {len(interictal_rows)}')
-    print(f'  Total sequences     : {len(metadata_rows)}')
-    print(f'  Metadata saved to   : {metadata_path}')
-    print(f'\nDataset build complete for [{config_name}].')
+    logger.info(f'\nDataset summary [{config_name}]')
+    logger.info(f'  Patients processed  : {patients_done}')
+    logger.info(f'  Pre-ictal sequences : {len(preictal_rows)}')
+    logger.info(f'  Interictal sequences: {len(interictal_rows)}')
+    logger.info(f'  Total sequences     : {len(metadata_rows)}')
+    logger.info(f'  Metadata saved to   : {metadata_path}')
+    logger.info(f'\nDataset build complete for [{config_name}].')
 
     return {
         'config_name':   config_name,

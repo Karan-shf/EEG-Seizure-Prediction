@@ -54,9 +54,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import SeizureDataset, get_splits, make_dataloaders
 from model import SeizurePredictor, ModelConfig
-from logger import get_logger
-
-logger = get_logger(name='evaluate')
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -90,7 +87,7 @@ DEVICE = (
 # Load checkpoint
 # ---------------------------------------------------------------------------
 
-def load_model(checkpoint_path: str) -> SeizurePredictor:
+def load_model(checkpoint_path: str, logger) -> SeizurePredictor:
     """Load the best saved model from checkpoint."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
@@ -281,7 +278,7 @@ def compute_per_patient_metrics(results: dict, threshold: float = THRESHOLD) -> 
 # Plots
 # ---------------------------------------------------------------------------
 
-def plot_roc_curve(metrics: dict, save_path: str):
+def plot_roc_curve(metrics: dict, save_path: str, logger):
     """Plot and save the ROC curve."""
     fig, ax = plt.subplots(figsize=(7, 7))
 
@@ -314,7 +311,7 @@ def plot_roc_curve(metrics: dict, save_path: str):
     logger.info(f'ROC curve saved to {save_path}')
 
 
-def plot_confusion_matrix(metrics: dict, save_path: str):
+def plot_confusion_matrix(metrics: dict, save_path: str, logger):
     """Plot and save the confusion matrix."""
     cm = np.array([
         [metrics['tn'], metrics['fp']],
@@ -349,8 +346,7 @@ def plot_confusion_matrix(metrics: dict, save_path: str):
     logger.info(f'Confusion matrix saved to {save_path}')
 
 
-def plot_attention_heatmap(results: dict, save_path: str,
-                           n_samples: int = 6):
+def plot_attention_heatmap(results: dict, save_path: str, logger, n_samples: int = 6):
     """
     Plot attention weight heatmaps for a sample of correctly predicted
     preictal sequences.
@@ -428,7 +424,7 @@ def plot_attention_heatmap(results: dict, save_path: str,
     logger.info(f'Attention heatmap saved to {save_path}')
 
 
-def plot_mean_attention(results: dict, save_path: str):
+def plot_mean_attention(results: dict, save_path: str, logger):
     """
     Plot the mean attention weight curve across all correctly predicted
     preictal sequences, with standard deviation band.
@@ -498,7 +494,7 @@ def plot_mean_attention(results: dict, save_path: str):
 # ---------------------------------------------------------------------------
 
 def print_report(metrics: dict, per_patient: pd.DataFrame,
-                 checkpoint_path: str):
+                 checkpoint_path: str, logger):
     """Print a clean evaluation report to terminal."""
     logger.info('\n' + '=' * 55)
     logger.info('SeizureHorizon — Evaluation Report')
@@ -555,14 +551,23 @@ def evaluate(
     threshold       : float — classification threshold
     config_name     : str — label for this run, used in printed report
     """
+
+    from logger import get_logger
+
     os.makedirs(output_dir, exist_ok=True)
+    
+    logger = get_logger(
+        name=f'{config_name}_eval' if config_name else 'evaluate',
+        log_dir=os.path.join('experiments', 'logs', config_name or 'default'),
+    )
+
     device = torch.device(DEVICE)
     logger.info(f'[Evaluate] Device: {device}')
     if config_name:
         print(f'[Evaluate] Config: {config_name}')
 
     # --- Load model ---
-    model = load_model(checkpoint_path)
+    model = load_model(checkpoint_path, logger)
     model = model.to(device)
 
     # --- Build test DataLoader ---
@@ -588,7 +593,7 @@ def evaluate(
     per_patient = compute_per_patient_metrics(results, threshold=threshold)
 
     # --- Print report ---
-    print_report(metrics, per_patient, checkpoint_path)
+    print_report(metrics, per_patient, checkpoint_path, logger)
 
     # --- Save metrics as JSON ---
     metrics_save = {k: v for k, v in metrics.items()
@@ -606,19 +611,23 @@ def evaluate(
     # --- Plots ---
     plot_roc_curve(
         metrics,
-        os.path.join(output_dir, 'roc_curve.png')
+        os.path.join(output_dir, 'roc_curve.png'),
+        logger
     )
     plot_confusion_matrix(
         metrics,
-        os.path.join(output_dir, 'confusion_matrix.png')
+        os.path.join(output_dir, 'confusion_matrix.png'),
+        logger
     )
     plot_attention_heatmap(
         results,
-        os.path.join(output_dir, 'attention_heatmap.png')
+        os.path.join(output_dir, 'attention_heatmap.png'),
+        logger
     )
     plot_mean_attention(
         results,
-        os.path.join(output_dir, 'mean_attention.png')
+        os.path.join(output_dir, 'mean_attention.png'),
+        logger
     )
 
     logger.info(f'\n[Evaluate] All outputs saved to {output_dir}/')

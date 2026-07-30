@@ -41,9 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import SeizureDataset, get_splits, make_dataloaders, infer_n_frames
 from model import SeizurePredictor, ModelConfig, model_summary
-from logger import get_logger
 
-logger = get_logger(name='train')
 
 # ---------------------------------------------------------------------------
 # Training configuration
@@ -235,7 +233,7 @@ def validate(model, loader, criterion, device):
 # Plot training curves
 # ---------------------------------------------------------------------------
 
-def plot_training_curves(history: dict, save_path: str):
+def plot_training_curves(history: dict, save_path: str, logger):
     """
     Plot loss and AUC curves for train and validation.
     Saves to experiments/results/training_curves.png.
@@ -292,6 +290,18 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
     train_cfg : TrainConfig — paths, epochs, lr, etc.
     model_cfg : ModelConfig — model hyperparameters
     """
+
+    from logger import get_logger
+
+    set_seed(train_cfg.seed)
+    os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
+    os.makedirs(train_cfg.log_dir,        exist_ok=True)
+    logger = get_logger(
+        name=f'{train_cfg.config_name}_train', 
+        log_dir=train_cfg.log_dir
+    )
+    os.makedirs(train_cfg.results_dir,    exist_ok=True)
+
     # Infer n_frames from actual saved sequences for this config,
     # rather than assuming a fixed value — critical for the grid search
     # where each (offset, duration) combination has a different frame count
@@ -302,11 +312,6 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
               f'{model_cfg.n_frames} → {inferred_n_frames} '
               f'(inferred from {train_cfg.sequences_dir})')
         model_cfg.n_frames = inferred_n_frames
-
-    set_seed(train_cfg.seed)
-    os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
-    os.makedirs(train_cfg.log_dir,        exist_ok=True)
-    os.makedirs(train_cfg.results_dir,    exist_ok=True)
 
     device = torch.device(train_cfg.device)
     logger.info(f'\n[Train] Device: {device}')
@@ -427,7 +432,7 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
 
     # Plot curves
     curves_path = os.path.join(train_cfg.results_dir, 'training_curves.png')
-    plot_training_curves(history, curves_path)
+    plot_training_curves(history, curves_path, logger)
 
     return {
         'config_name':   train_cfg.config_name,
@@ -447,17 +452,17 @@ if __name__ == '__main__':
     train_cfg = TrainConfig()
     model_cfg = ModelConfig()
 
-    logger.info('=' * 55)
-    logger.info('SeizureHorizon — Training')
-    logger.info('=' * 55)
-    logger.info(f'Split strategy : {train_cfg.split_strategy}')
-    logger.info(f'Max epochs     : {train_cfg.max_epochs}')
-    logger.info(f'Batch size     : {train_cfg.batch_size}')
-    logger.info(f'Learning rate  : {train_cfg.learning_rate}')
-    logger.info(f'Early stopping : patience={train_cfg.patience}')
-    logger.info(f'Device         : {train_cfg.device}')
+    print('=' * 55)
+    print('SeizureHorizon — Training')
+    print('=' * 55)
+    print(f'Split strategy : {train_cfg.split_strategy}')
+    print(f'Max epochs     : {train_cfg.max_epochs}')
+    print(f'Batch size     : {train_cfg.batch_size}')
+    print(f'Learning rate  : {train_cfg.learning_rate}')
+    print(f'Early stopping : patience={train_cfg.patience}')
+    print(f'Device         : {train_cfg.device}')
 
     result = train(train_cfg, model_cfg)
 
-    logger.info(f'\nFinal best validation AUC: {result["best_val_auc"]:.4f}')
-    logger.info('Run evaluate.py next to test on held-out patients.')
+    print(f'\nFinal best validation AUC: {result["best_val_auc"]:.4f}')
+    print('Run evaluate.py next to test on held-out patients.')
