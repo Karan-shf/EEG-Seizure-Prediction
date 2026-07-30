@@ -63,7 +63,16 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 .agents
 
 # dataset
-data/
+data/*
+!data/raw/
+!data/raw/chb-mit/
+!data/raw/chb-mit/.gitkeep
+!data/processed/
+!data/processed/.gitkeep
+data/raw/chb-mit/*
+!data/raw/chb-mit/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 
 # Jupyter Notebook Outputs
 .ipynb_checkpoints/

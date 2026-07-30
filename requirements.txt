@@ -1,0 +1,34 @@
+# SeizureHorizon — Project Requirements
+# EEG-based seizure prediction pipeline (CHB-MIT dataset)
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Note: NumPy is pinned below 2.0 due to a binary incompatibility with
+# the PyTorch build used in this project (see project notes). Install
+# numpy<2 BEFORE torch if installing manually, or let pip resolve order.
+
+# --- Core numerical / scientific computing ---
+numpy<2
+scipy>=1.11,<2.0
+pandas>=2.0,<3.0
+
+# --- EEG signal processing ---
+mne>=1.6,<2.0
+
+# --- Deep learning ---
+torch>=2.2,<3.0
+
+# --- Machine learning metrics / utilities ---
+scikit-learn>=1.3,<2.0
+
+# --- Visualization ---
+matplotlib>=3.7,<4.0
+
+# --- Notebook environment ---
+jupyter>=1.0,<2.0
+notebook>=7.0,<8.0
+ipykernel>=6.25,<7.0
+
+# --- Progress bars / logging niceties (optional but used in long-running scripts) ---
+tqdm>=4.66,<5.0
