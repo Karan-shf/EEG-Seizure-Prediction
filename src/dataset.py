@@ -238,7 +238,7 @@ class SeizureDataset(Dataset):
             # Only applied to non-padded (real) frames.
             non_zero_mask = seq.sum(axis=(1, 2)) != 0
             if non_zero_mask.sum() > 0:
-                noise_std = seq[non_zero_mask].std() * 0.05   # 5% of signal std
+                noise_std = seq[non_zero_mask].std() * 0.02   # 2% (5% washed out the weak distal signal)
                 noise = np.random.normal(0, noise_std, size=seq.shape).astype(np.float32)
                 seq[non_zero_mask] += noise[non_zero_mask]
 
@@ -247,7 +247,7 @@ class SeizureDataset(Dataset):
             # Forces the model to not over-rely on any single electrode,
             # improving robustness to electrode artifacts or disconnections.
             n_channels = seq.shape[2]
-            n_drop = np.random.choice([0, 1, 2], p=[0.5, 0.35, 0.15])  # usually 0-1 dropped
+            n_drop = np.random.choice([0, 1], p=[0.8, 0.2])  # at most 1 dropped; usually none
             if n_drop > 0:
                 drop_channels = np.random.choice(n_channels, size=n_drop, replace=False)
                 seq[:, :, drop_channels] = 0.0
@@ -277,11 +277,13 @@ class SeizureDataset(Dataset):
             # Pass pos_weight to BCEWithLogitsLoss:
             criterion = nn.BCEWithLogitsLoss(pos_weight=weights[1])
         """
-        total = self.n_preictal + self.n_interictal
-        # Inverse frequency weighting with preictal bias factor
-        preictal_bias = 1.5
-        w_interictal  = total / (2 * self.n_interictal)
-        w_preictal    = total / (2 * self.n_preictal) * preictal_bias
+        # pos_weight for BCEWithLogitsLoss should be n_negative / n_positive
+        # = n_interictal / n_preictal. That alone corrects the imbalance.
+        # The old extra 1.5x "preictal bias" double-counted on top of the
+        # already-minority preictal class and forced every prediction positive
+        # (test specificity collapsed to 0.0).
+        w_interictal  = 1.0
+        w_preictal    = self.n_interictal / self.n_preictal
         weights = torch.tensor([w_interictal, w_preictal], dtype=torch.float32)
         print(f'[Dataset] Class weights — interictal: {w_interictal:.3f} | '
               f'preictal: {w_preictal:.3f}')

@@ -28,8 +28,13 @@ import csv
 import json
 import numpy as np
 
-from parse_summaries import parse_all_summaries, get_all_seizure_events
-from preprocessing import build_sequence_from_edf, PRE_ICTAL_SECS, WINDOW_SECONDS, STRIDE_SECONDS
+from parse_summaries import (
+    parse_all_summaries, get_all_seizure_events, parse_all_file_times,
+)
+from preprocessing import (
+    build_sequence_from_edf, build_sequence_multifile, build_patient_timeline,
+    PRE_ICTAL_SECS, WINDOW_SECONDS, STRIDE_SECONDS,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -134,7 +139,11 @@ def process_preictal_event(
     offset_sec: float,
     duration_sec: float,
     target_frames: int,
-    logger
+    logger,
+    timeline: dict | None = None,
+    patient_dir: str | None = None,
+    abs_onset: float | None = None,
+    earliest_allowed_abs: float | None = None,
 ) -> dict | None:
     """
     Extract a pre-ictal sequence for one seizure event and save it.
@@ -154,13 +163,28 @@ def process_preictal_event(
         )
 
     try:
-        sequence, sfreq, n_ch = build_sequence_from_edf(
-            edf_path,
-            anchor_time=float(onset),
-            duration=float(duration_sec),
-            offset=float(offset_sec),
-            target_n_windows=target_frames,
-        )
+        if timeline and abs_onset is not None and patient_dir is not None and filename in timeline:
+            # Stitch across contiguous files so the window can reach back
+            # before this file's own t=0 (the fix that unlocks large offsets).
+            sequence, sfreq, n_ch = build_sequence_multifile(
+                timeline, patient_dir,
+                abs_anchor=float(abs_onset),
+                duration=float(duration_sec),
+                offset=float(offset_sec),
+                target_n_windows=target_frames,
+                earliest_allowed_abs=earliest_allowed_abs,
+                logger=logger,
+            )
+        else:
+            # Fallback: single-file extraction (patients/files without clock
+            # stamps, e.g. chb24).
+            sequence, sfreq, n_ch = build_sequence_from_edf(
+                edf_path,
+                anchor_time=float(onset),
+                duration=float(duration_sec),
+                offset=float(offset_sec),
+                target_n_windows=target_frames,
+            )
         np.save(save_path, sequence)
         logger.info(f'  [SAVED] {save_name}  shape={sequence.shape}  sfreq={sfreq}')
 
@@ -355,6 +379,10 @@ def build_dataset(
     all_events    = get_all_seizure_events(seizure_index)
     logger.info(f'\nTotal seizure events found: {len(all_events)}\n')
 
+    logger.info('Step 1b: Parsing per-file clock times for cross-file stitching...')
+    file_times_all = parse_all_file_times(CHBMIT_ROOT, logger)
+    logger.info(f'Patients with usable file-time stamps: {len(file_times_all)}\n')
+
     metadata_rows = []
 
     for patient_id, patient_data in sorted(seizure_index.items()):
@@ -367,43 +395,85 @@ def build_dataset(
         preictal_count = 0
         inter_counter  = [0]
 
-        # --- Pre-ictal sequences ---
-        for filename, seizures in sorted(patient_data.items()):
-            if not seizures:
-                continue
+        # Absolute-seconds timeline for this patient (empty if no clock stamps,
+        # in which case preictal extraction falls back to single-file mode).
+        ordered_files = sorted(patient_data.keys())
+        patient_ft    = file_times_all.get(patient_id, {})
+        timeline      = build_patient_timeline(patient_ft, ordered_files) if patient_ft else {}
+        if timeline:
+            logger.info(f'  Timeline built for {len(timeline)} files')
 
+        # --- Pre-ictal sequences (absolute-timeline aware) ---
+        # Flatten every seizure for this patient; attach absolute onset/offset
+        # when the file is on the timeline so windows can stitch across files
+        # and be ordered globally.
+        flat = []
+        for filename, seizures in patient_data.items():
+            for sz in seizures:
+                if filename in timeline:
+                    base = timeline[filename]['abs_start']
+                    abs_onset = base + sz['onset']
+                    abs_off   = base + (sz['offset'] if sz['offset'] else sz['onset'])
+                else:
+                    abs_onset = abs_off = None
+                flat.append({'filename': filename, 'onset': sz['onset'],
+                            'offset': sz['offset'],
+                            'abs_onset': abs_onset, 'abs_off': abs_off})
+
+        flat.sort(key=lambda e: (
+            e['abs_onset'] if e['abs_onset'] is not None else float('inf'),
+            e['filename'], e['onset'],
+        ))
+
+        min_gap_needed   = offset_sec + duration_sec
+        prev_abs_off     = None      # absolute end of previous seizure
+        prev_local_off   = None      # local end (single-file fallback)
+        prev_file        = None
+
+        for ev in flat:
+            filename = ev['filename']
+            onset    = ev['onset']
             edf_path = os.path.join(patient_dir, filename)
             if not os.path.exists(edf_path):
                 logger.info(f'  [MISSING EDF] {edf_path}')
                 continue
 
-            logger.info(f'\n  File: {filename}')
-            prev_offset = None
-
-            for sz in sorted(seizures, key=lambda x: x['onset']):
-                onset  = sz['onset']
-                offset = sz['offset']
-
-                # Skip if too close to previous seizure given this window's reach
-                min_gap_needed = offset_sec + duration_sec
-                if prev_offset is not None and onset - prev_offset < min_gap_needed:
+            earliest_allowed_abs = None
+            if ev['abs_onset'] is not None:
+                if prev_abs_off is not None and (ev['abs_onset'] - prev_abs_off) < min_gap_needed:
                     logger.info(f'  [SKIP — too close to previous seizure] '
-                          f'onset={onset}s, prev_offset={prev_offset}s')
-                    prev_offset = offset
+                                f'{filename} abs_onset={ev["abs_onset"]:.0f}s '
+                                f'prev_off={prev_abs_off:.0f}s')
+                    prev_abs_off = ev['abs_off']; prev_file = filename
+                    continue
+                earliest_allowed_abs = prev_abs_off   # never reach into prior seizure
+            else:
+                # single-file fallback: only compare within the same file
+                if prev_file == filename and prev_local_off is not None \
+                        and (onset - prev_local_off) < min_gap_needed:
+                    logger.info(f'  [SKIP — too close to previous seizure] '
+                                f'{filename} onset={onset}s')
+                    prev_local_off = ev['offset']; prev_file = filename
                     continue
 
-                preictal_count += 1
-                row = process_preictal_event(
-                    patient_id, filename, onset, preictal_count, edf_path, output_dir,
-                    offset_sec=offset_sec,
-                    duration_sec=duration_sec,
-                    target_frames=target_frames,
-                    logger=logger
-                )
-                if row:
-                    metadata_rows.append(row)
+            preictal_count += 1
+            row = process_preictal_event(
+                patient_id, filename, onset, preictal_count, edf_path, output_dir,
+                offset_sec=offset_sec,
+                duration_sec=duration_sec,
+                target_frames=target_frames,
+                logger=logger,
+                timeline=timeline,
+                patient_dir=patient_dir,
+                abs_onset=ev['abs_onset'],
+                earliest_allowed_abs=earliest_allowed_abs,
+            )
+            if row:
+                metadata_rows.append(row)
 
-                prev_offset = offset
+            prev_abs_off   = ev['abs_off']
+            prev_local_off = ev['offset']
+            prev_file      = filename
 
         # --- Interictal sequences ---
         for filename, seizures in sorted(patient_data.items()):

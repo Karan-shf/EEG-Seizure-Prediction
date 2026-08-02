@@ -19,6 +19,7 @@ from src.preprocessing import load_and_filter, extract_segment, compute_sequence
 
 import numpy as np
 import mne
+import os
 from scipy.signal import welch
 import warnings
 
@@ -61,6 +62,10 @@ BANDPASS_HIGH    = 40.0
 # Minimum number of seconds of EEG required before seizure onset
 # to include an event (we accept anything > 0 due to zero-padding strategy)
 MIN_AVAILABLE_SECS = 10
+
+# Two consecutive CHB-MIT files are treated as continuous if the gap between
+# one file's end and the next file's start is within this tolerance (seconds).
+CONTIGUITY_TOLERANCE_SECS = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +167,145 @@ def extract_segment(
     data = np.asarray(raw_segment.get_data())  # shape: (n_channels, n_samples)
 
     return data, actual_duration
+
+
+def _clock_to_seconds(hhmmss: str) -> int:
+    """'HH:MM:SS' -> integer seconds. Hours may exceed 23 in CHB-MIT summaries."""
+    h, m, s = hhmmss.split(':')
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
+def build_patient_timeline(file_times: dict, ordered_files: list) -> dict:
+    """
+    Convert per-file clock stamps into a monotonic absolute-seconds timeline
+    for one patient.
+
+    file_times    : {filename: {'start': 'HH:MM:SS', 'end': 'HH:MM:SS'}}
+    ordered_files : filenames in chronological (sorted) order
+
+    Returns {filename: {'abs_start': float, 'abs_end': float, 'duration': float}}
+    Only files present in file_times are included. Midnight rollovers are
+    resolved by forcing each successive start to be >= the previous start.
+    A file missing from file_times breaks the chain (neighbours are not treated
+    as contiguous across it).
+    """
+    timeline = {}
+    prev_abs_start = None
+    add = 0
+    for fname in ordered_files:
+        if fname not in file_times:
+            prev_abs_start = None          # unknown timing -> break the chain
+            continue
+        sc = _clock_to_seconds(file_times[fname]['start'])
+        ec = _clock_to_seconds(file_times[fname]['end'])
+        abs_start = sc + add
+        if prev_abs_start is not None:
+            while abs_start < prev_abs_start:   # wrapped past midnight -> add a day
+                add += 24 * 3600
+                abs_start = sc + add
+        duration = ec - sc
+        if duration < 0:                        # file itself crosses midnight
+            duration += 24 * 3600
+        timeline[fname] = {
+            'abs_start': float(abs_start),
+            'abs_end':   float(abs_start + duration),
+            'duration':  float(duration),
+        }
+        prev_abs_start = abs_start
+    return timeline
+
+
+def extract_window_multifile(
+    timeline: dict,
+    patient_dir: str,
+    abs_end: float,
+    duration: float,
+    earliest_allowed_abs: float | None = None,
+    tol: float = CONTIGUITY_TOLERANCE_SECS,
+    logger=None,
+) -> tuple:
+    """
+    Extract a contiguous EEG segment ENDING at absolute time abs_end, reaching
+    back up to `duration` seconds, crossing contiguous file boundaries as
+    needed. Stops early at a recording gap, a channel/sfreq mismatch, a missing
+    file, or earliest_allowed_abs (e.g. end of the previous seizure). The
+    missing front is left for compute_sequence to zero-pad.
+
+    Returns (segment_data, actual_duration, sfreq, n_channels)
+      segment_data : (n_channels, n_samples), time-ordered (most recent last)
+      actual_duration : seconds of real (non-padded) data collected
+    Raises ValueError if no usable data can be collected at all.
+    """
+    abs_start_desired = abs_end - duration
+    if earliest_allowed_abs is not None:
+        abs_start_desired = max(abs_start_desired, earliest_allowed_abs)
+
+    # Files overlapping [abs_start_desired, abs_end], newest first
+    overlapping = sorted(
+        [(fn, t) for fn, t in timeline.items()
+         if t['abs_end'] > abs_start_desired and t['abs_start'] < abs_end],
+        key=lambda kv: kv[1]['abs_start'],
+        reverse=True,
+    )
+    if not overlapping:
+        raise ValueError(
+            f'No files overlap window [{abs_start_desired:.0f}, {abs_end:.0f}] abs-s.'
+        )
+
+    chunks = []
+    ref_sfreq = None
+    ref_nch = None
+    cursor = abs_end          # absolute time our collected data reaches back to
+
+    for fname, t in overlapping:
+        if t['abs_end'] < cursor - tol:        # gap -> stop, front gets padded
+            if logger:
+                logger.info(f'    [stitch stop] gap before {fname} '
+                            f'(file_end={t["abs_end"]:.0f}, need={cursor:.0f})')
+            break
+        edf_path = os.path.join(patient_dir, fname)
+        if not os.path.exists(edf_path):
+            break
+
+        raw = load_and_filter(edf_path)
+        sfreq = raw.info['sfreq']
+
+        seg_hi_abs = min(cursor, t['abs_end'])
+        seg_lo_abs = max(abs_start_desired, t['abs_start'])
+        local_hi = min(seg_hi_abs - t['abs_start'], float(raw.times[-1]))
+        local_lo = max(0.0, seg_lo_abs - t['abs_start'])
+        if local_hi - local_lo <= 0:
+            break
+
+        data = np.asarray(raw.copy().crop(tmin=local_lo, tmax=local_hi).get_data())
+
+        if ref_sfreq is None:
+            ref_sfreq, ref_nch = sfreq, data.shape[0]
+        elif sfreq != ref_sfreq or data.shape[0] != ref_nch:
+            if logger:
+                logger.info(f'    [stitch stop] {fname}: montage/sfreq mismatch '
+                            f'({sfreq},{data.shape[0]}) vs ({ref_sfreq},{ref_nch})')
+            break
+
+        chunks.append(data)
+        cursor = seg_lo_abs
+        if cursor <= abs_start_desired + tol:
+            break
+
+    if not chunks:
+        raise ValueError('No usable EEG collected for window.')
+    assert ref_sfreq is not None  # guaranteed set once chunks is non-empty
+
+    # collected newest-first -> reverse to time order and concatenate
+    segment_data = np.concatenate(chunks[::-1], axis=1)
+
+    # Trim any overshoot so the window is exactly `duration` and END-aligned
+    max_samples = int(round(duration * ref_sfreq))
+    if segment_data.shape[1] > max_samples:
+        segment_data = segment_data[:, -max_samples:]
+
+    actual_duration = segment_data.shape[1] / ref_sfreq
+    return segment_data, actual_duration, ref_sfreq, ref_nch
 
 # ---------------------------------------------------------------------------
 # Step 3 — Band power for one window
@@ -329,6 +473,45 @@ def build_sequence_from_edf(
     )
 
     return sequence, sfreq, segment_data.shape[0]
+
+
+def build_sequence_multifile(
+    timeline: dict,
+    patient_dir: str,
+    abs_anchor: float,
+    duration: float,
+    offset: float = 0.0,
+    target_n_windows: int | None = None,
+    earliest_allowed_abs: float | None = None,
+    logger=None,
+) -> tuple:
+    """
+    Multi-file counterpart to build_sequence_from_edf. Extracts the window
+    ending `offset` seconds before `abs_anchor` (absolute patient-timeline
+    seconds), spanning `duration` seconds, stitching across contiguous files,
+    then computes the band-power sequence (front zero-padded if the recording
+    doesn't reach back far enough).
+    """
+    abs_end = abs_anchor - offset
+    if abs_end <= 0:
+        raise ValueError(f'Window end {abs_end:.0f}s <= 0 on patient timeline.')
+
+    segment_data, actual_duration, sfreq, n_ch = extract_window_multifile(
+        timeline, patient_dir, abs_end, duration,
+        earliest_allowed_abs=earliest_allowed_abs, logger=logger,
+    )
+
+    if target_n_windows is None:
+        samples_per_win    = int(WINDOW_SECONDS * sfreq)
+        samples_per_stride = int(STRIDE_SECONDS * sfreq)
+        target_n_windows = (
+            (int(duration * sfreq) - samples_per_win) // samples_per_stride
+        ) + 1
+
+    sequence = compute_sequence(
+        segment_data, actual_duration, sfreq, target_n_windows=target_n_windows
+    )
+    return sequence, sfreq, n_ch
 
 
 if __name__ == "__main__":

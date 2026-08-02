@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from build_dataset import build_dataset
-from dataset import infer_n_frames
+from dataset import infer_n_frames, FIXED_TEST_PATIENTS, FIXED_VAL_PATIENTS
 from model import ModelConfig
 from train import TrainConfig, train
 from evaluate import evaluate
@@ -105,6 +105,20 @@ def run_one_config(offset_minutes: int, duration_minutes: int) -> dict:
                 f'interictal={build_info["n_interictal"]}). Skipping.'
             )
 
+        # Totals can look fine while the FIXED test/val patients have zero (or
+        # single-class) sequences — this is why all offset60 configs crashed deep
+        # in the dataloader with a cryptic "No sequences found". Check per split
+        # up front and fail with an interpretable message instead.
+        _meta = pd.read_csv(build_info['metadata_path'])
+        for _split, _pats in (('test', FIXED_TEST_PATIENTS), ('val', FIXED_VAL_PATIENTS)):
+            _sub = _meta[_meta['patient_id'].isin(_pats)]
+            if _sub.empty or _sub['label'].nunique() < 2:
+                raise RuntimeError(
+                    f'{_split} split unusable for {config_name}: '
+                    f'{len(_sub)} sequences, classes={sorted(_sub["label"].unique())}. '
+                    f'Exceeds CHB-MIT lead-in ceiling for these patients.'
+                )
+
         # --- Step 2: Train ---
         print(f'\n[{config_name}] Step 2/3 — Training...')
         n_frames = infer_n_frames(build_info['output_dir'])
@@ -132,6 +146,8 @@ def run_one_config(offset_minutes: int, duration_minutes: int) -> dict:
             checkpoint_path=train_result['checkpoint_path'],
             output_dir=os.path.join(RESULTS_ROOT, config_name, 'evaluation'),
             config_name=config_name,
+            offset_minutes=offset_minutes,
+            duration_minutes=duration_minutes,
         )
 
         elapsed = time.time() - t_start
@@ -325,5 +341,4 @@ def run_grid_search():
 
 
 if __name__ == '__main__':
-    # run_grid_search()
-    run_one_config(offset_minutes=30, duration_minutes=15)
+    run_grid_search()

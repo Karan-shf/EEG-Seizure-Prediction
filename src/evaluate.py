@@ -73,8 +73,10 @@ DEFAULT_OUTPUT_DIR      = 'experiments/results/offset0_dur30/evaluation'
 # THRESHOLD = 0.5
 THRESHOLD = 0.35
 
-# Window duration in seconds — used to compute FPR/h
+# Frames advance by STRIDE (not WINDOW), so each sequence spans
+# n_frames × STRIDE_SECONDS of EEG. Needed for a correct FPR/h.
 WINDOW_SECONDS = 5
+STRIDE_SECONDS = 3
 
 DEVICE = (
     'mps'  if torch.backends.mps.is_available() else
@@ -166,11 +168,20 @@ def run_inference(model, loader, device) -> dict:
     }
 
 
+def pick_threshold_youden(probas: np.ndarray, labels: np.ndarray) -> float:
+    """Threshold maximising Youden's J (sensitivity + specificity - 1),
+    chosen on the validation set. Falls back to 0.5 if degenerate."""
+    fpr, tpr, thr = roc_curve(labels, probas)
+    best = int(np.argmax(tpr - fpr))
+    t = float(thr[best])
+    return t if np.isfinite(t) else 0.5   # roc_curve prepends an inf threshold
+
 # ---------------------------------------------------------------------------
 # Compute metrics
 # ---------------------------------------------------------------------------
 
 def compute_metrics(probas: np.ndarray, labels: np.ndarray,
+                    n_frames: int,
                     threshold: float = THRESHOLD) -> dict:
     """
     Compute all classification and clinical metrics.
@@ -205,8 +216,12 @@ def compute_metrics(probas: np.ndarray, labels: np.ndarray,
     # Each sequence represents WINDOW_SECONDS × N_FRAMES seconds of EEG
     # A false positive is one false alarm per sequence
     # Convert to alarms per hour
+    # 360 was only right for the old 30-min, non-overlapping design. For dur15
+    # (299 frames × 3s ≈ 15 min) the old formula understated FPR/h ~2x
+    # (reported 2.0 should have been ~4.0).
     total_interictal_sequences = int((labels == 0).sum())
-    total_interictal_hours     = (total_interictal_sequences * 360 * WINDOW_SECONDS) / 3600
+    seconds_per_sequence       = n_frames * STRIDE_SECONDS
+    total_interictal_hours     = (total_interictal_sequences * seconds_per_sequence) / 3600
     fpr_per_hour = fp / total_interictal_hours if total_interictal_hours > 0 else 0.0
 
     return {
@@ -227,7 +242,8 @@ def compute_metrics(probas: np.ndarray, labels: np.ndarray,
     }
 
 
-def compute_per_patient_metrics(results: dict, threshold: float = THRESHOLD) -> pd.DataFrame:
+def compute_per_patient_metrics(results: dict, n_frames: int,
+                                threshold: float = THRESHOLD) -> pd.DataFrame:
     """
     Compute metrics broken down by patient.
     Returns a DataFrame with one row per patient.
@@ -256,7 +272,7 @@ def compute_per_patient_metrics(results: dict, threshold: float = THRESHOLD) -> 
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
         specificity = tn / (tn + fp) if (tn + fp) > 0 else float('nan')
 
-        inter_hours = (n_interictal * 360 * WINDOW_SECONDS) / 3600
+        inter_hours = (n_interictal * n_frames * STRIDE_SECONDS) / 3600
         fpr_h = fp / inter_hours if inter_hours > 0 else float('nan')
 
         rows.append({
@@ -346,7 +362,9 @@ def plot_confusion_matrix(metrics: dict, save_path: str, logger):
     logger.info(f'Confusion matrix saved to {save_path}')
 
 
-def plot_attention_heatmap(results: dict, save_path: str, logger, n_samples: int = 6):
+def plot_attention_heatmap(results: dict, save_path: str, logger,
+                           offset_minutes: int = 0, duration_minutes: int = 30,
+                           n_samples: int = 6):
     """
     Plot attention weight heatmaps for a sample of correctly predicted
     preictal sequences.
@@ -385,9 +403,12 @@ def plot_attention_heatmap(results: dict, save_path: str, logger, n_samples: int
         fontsize=12, y=1.01
     )
 
-    # Time axis: frame 0 = 30 min before, frame 359 = seizure onset
+    # This window spans from -(offset+duration) to -offset min before onset.
+    # (Hardcoded -30..0 mislabeled every config where offset!=0 or duration!=30.)
     n_frames   = attns.shape[1]
-    time_mins  = np.linspace(-30, 0, n_frames)
+    t_start    = -(offset_minutes + duration_minutes)
+    t_end      = -offset_minutes
+    time_mins  = np.linspace(t_start, t_end, n_frames)
 
     for ax, idx in zip(axes, indices):
         attn = attns[idx]                  # (360,)
@@ -399,7 +420,7 @@ def plot_attention_heatmap(results: dict, save_path: str, logger, n_samples: int
             attn[np.newaxis, :],
             aspect='auto',
             cmap='YlOrRd',
-            extent=[-30, 0, 0, 1],
+            extent=[t_start, t_end, 0, 1],
             vmin=0,
         )
         ax.set_yticks([])
@@ -424,7 +445,8 @@ def plot_attention_heatmap(results: dict, save_path: str, logger, n_samples: int
     logger.info(f'Attention heatmap saved to {save_path}')
 
 
-def plot_mean_attention(results: dict, save_path: str, logger):
+def plot_mean_attention(results: dict, save_path: str, logger,
+                        offset_minutes: int = 0, duration_minutes: int = 30):
     """
     Plot the mean attention weight curve across all correctly predicted
     preictal sequences, with standard deviation band.
@@ -449,7 +471,9 @@ def plot_mean_attention(results: dict, save_path: str, logger):
     std_attn    = attn_subset.std(axis=0)     # (360,)
 
     n_frames  = attns.shape[1]
-    time_mins = np.linspace(-30, 0, n_frames)
+    t_start   = -(offset_minutes + duration_minutes)
+    t_end     = -offset_minutes
+    time_mins = np.linspace(t_start, t_end, n_frames)
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -478,7 +502,7 @@ def plot_mean_attention(results: dict, save_path: str, logger):
     )
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3)
-    ax.set_xlim(-30, 2)
+    ax.set_xlim(t_start, t_end + 2)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -540,6 +564,8 @@ def evaluate(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     threshold: float = THRESHOLD,
     config_name: str | None = None,
+    offset_minutes: int = 0,
+    duration_minutes: int = 30,
 ):
     """
     Parameters
@@ -575,7 +601,7 @@ def evaluate(
     folds = get_splits(meta, strategy='fixed')
     train_p, val_p, test_p = folds[0]
 
-    _, _, test_loader = make_dataloaders(
+    _, val_loader, test_loader = make_dataloaders(
         meta, sequences_dir,
         train_p, val_p, test_p,
         batch_size=16,
@@ -586,11 +612,23 @@ def evaluate(
           f'test sequences from patients: {test_p}')
 
     # --- Inference ---
-    results = run_inference(model, test_loader, device)
+    results  = run_inference(model, test_loader, device)
+    n_frames = results['attn_weights'].shape[1]
 
-    # --- Metrics ---
-    metrics     = compute_metrics(results['probas'], results['labels'], threshold=threshold)
-    per_patient = compute_per_patient_metrics(results, threshold=threshold)
+    # --- Calibrate threshold on VALIDATION (never on test) ---
+    # 0.35 was hardcoded and uncalibrated -> all-positive operating point.
+    val_results = run_inference(model, val_loader, device)
+    if len(np.unique(val_results['labels'])) == 2:
+        threshold = pick_threshold_youden(val_results['probas'], val_results['labels'])
+        logger.info(f'[Evaluate] Calibrated threshold on val set: {threshold:.3f}')
+    else:
+        logger.info(f'[Evaluate] Val set single-class — keeping threshold {threshold:.3f}')
+
+    # --- Metrics (at the calibrated threshold, with real frame count) ---
+    metrics     = compute_metrics(results['probas'], results['labels'],
+                                  n_frames=n_frames, threshold=threshold)
+    per_patient = compute_per_patient_metrics(results, n_frames=n_frames,
+                                              threshold=threshold)
 
     # --- Print report ---
     print_report(metrics, per_patient, checkpoint_path, logger)
@@ -622,12 +660,16 @@ def evaluate(
     plot_attention_heatmap(
         results,
         os.path.join(output_dir, 'attention_heatmap.png'),
-        logger
+        logger,
+        offset_minutes=offset_minutes,
+        duration_minutes=duration_minutes,
     )
     plot_mean_attention(
         results,
         os.path.join(output_dir, 'mean_attention.png'),
-        logger
+        logger,
+        offset_minutes=offset_minutes,
+        duration_minutes=duration_minutes,
     )
 
     logger.info(f'\n[Evaluate] All outputs saved to {output_dir}/')

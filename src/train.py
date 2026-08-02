@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import roc_auc_score
 
 # Make src/ importable when run directly
@@ -72,10 +72,9 @@ class TrainConfig:
     split_strategy = 'fixed'
 
     # Training
-    # max_epochs     = 100
     max_epochs     = 100
     batch_size     = 16
-    learning_rate  = 1e-3
+    learning_rate  = 3e-4    # 1e-3 was too hot for these small, noisy folds
     weight_decay   = 1e-4    # L2 regularisation — important for small datasets
 
     # Early stopping: stop if val AUC doesn't improve for this many epochs
@@ -281,7 +280,7 @@ def plot_training_curves(history: dict, save_path: str, logger):
 # Main training function
 # ---------------------------------------------------------------------------
 
-def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
+def train(train_cfg: TrainConfig, model_cfg: ModelConfig, fold: tuple | None = None):
     """
     Full training run for one fold.
 
@@ -318,8 +317,11 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
 
     # --- Data ---
     meta   = pd.read_csv(train_cfg.metadata_path)
-    folds  = get_splits(meta, strategy=train_cfg.split_strategy)
-    train_p, val_p, test_p = folds[0]   # fold 0 for fixed; loop over folds for LOPO
+    if fold is not None:
+        train_p, val_p, test_p = fold          # caller-injected (e.g. LOPO driver)
+    else:
+        folds = get_splits(meta, strategy=train_cfg.split_strategy)
+        train_p, val_p, test_p = folds[0]
 
     # Adaptive batch size: shrink if the training set is too small to form
     # even one full batch with drop_last=True. Never go below batch_size=2
@@ -378,14 +380,14 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
         weight_decay=train_cfg.weight_decay,
     )
 
-    # Cosine annealing with warm restarts: LR smoothly decreases following
-    # a cosine curve, then "restarts" to a higher value periodically.
-    # This helps escape local minima that plateau-based scheduling can get stuck in.
-    scheduler = CosineAnnealingWarmRestarts(
+    # Warm restarts kicked LR back to 1e-3 at epoch 10 and val AUC collapsed to
+    # 0.0 the very next epoch. On tiny folds, decay-on-plateau is far steadier.
+    scheduler = ReduceLROnPlateau(
         optimizer,
-        T_0=10,          # epochs until first restart
-        T_mult=2,        # each restart cycle doubles in length (10, 20, 40, ...)
-        eta_min=train_cfg.min_lr,
+        mode='max',                     # monitor val AUC (higher = better)
+        factor=train_cfg.lr_factor,     # 0.5 (already in TrainConfig)
+        patience=train_cfg.lr_patience, # 7  (already in TrainConfig)
+        min_lr=train_cfg.min_lr,        # 1e-5
     )
 
     # --- Training state ---
@@ -417,9 +419,8 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
             model, val_loader, criterion, device
         )
 
-        # CosineAnnealingWarmRestarts steps every epoch based on epoch count,
-        # not validation metric (unlike ReduceLROnPlateau)
-        scheduler.step(epoch)
+        # ReduceLROnPlateau steps on the monitored validation metric
+        scheduler.step(val_auc)
         current_lr = optimizer.param_groups[0]['lr']
 
         # Record history
@@ -429,14 +430,20 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
         history['val_auc'].append(val_auc)
         history['lr'].append(current_lr)
 
-        # Check for improvement
+        # The fixed val set is tiny, so single-epoch val AUC swings 0.0 -> 1.0.
+        # Selecting on a 3-epoch trailing mean (plus a small margin) stops one
+        # lucky epoch from being saved as "best" (e.g. the epoch-3 AUC=1.0 fluke).
+        MIN_DELTA = 1e-3
+        recent = [a for a in history['val_auc'][-3:] if not np.isnan(a)]
+        smoothed_val_auc = (sum(recent) / len(recent)) if recent else float('nan')
+
         improved = ''
-        if val_auc > best_val_auc:
-            best_val_auc   = val_auc
+        if not np.isnan(smoothed_val_auc) and smoothed_val_auc > best_val_auc + MIN_DELTA:
+            best_val_auc   = smoothed_val_auc
             best_epoch     = epoch
             epochs_no_improve = 0
             history['best_epoch'] = epoch
-            save_checkpoint(model, optimizer, epoch, val_auc,
+            save_checkpoint(model, optimizer, epoch, smoothed_val_auc,
                             model_cfg, checkpoint_path)
             improved = '✓ best'
         else:
@@ -452,6 +459,18 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig):
             logger.info(f'\n[Train] Early stopping at epoch {epoch} '
                   f'(no improvement for {train_cfg.patience} epochs)')
             break
+
+    # If val AUC never improved (e.g. single-class val fold -> NaN AUC, which
+    # never satisfies the improvement test), no checkpoint was ever written and
+    # evaluate.py would die with "Checkpoint not found". Save the final epoch as
+    # a fallback so every config is at least evaluable. (Fixed 9/16 configs.)
+    epochs_run = len(history['val_auc'])           # robust: not the leaked loop var
+    if best_epoch == 0 and epochs_run > 0:
+        logger.info('[Train] WARNING: no val-AUC improvement recorded '
+                    '(likely single-class val fold). Saving final epoch as fallback.')
+        save_checkpoint(model, optimizer, epochs_run, best_val_auc,
+                        model_cfg, checkpoint_path)
+        best_epoch = epochs_run
 
     logger.info(f'\n[Train] Training complete.')
     logger.info(f'  Best val AUC : {best_val_auc:.4f} at epoch {best_epoch}')

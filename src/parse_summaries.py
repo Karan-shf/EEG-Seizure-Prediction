@@ -99,6 +99,67 @@ def parse_patient_summary(summary_path: str) -> dict:
     return result
 
 
+def parse_patient_file_times(summary_path: str) -> dict:
+    """
+    Parse per-file 'File Start Time' / 'File End Time' clock stamps from one
+    chbXX-summary.txt.
+
+    Returns { 'chb01_03.edf': {'start': 'HH:MM:SS', 'end': 'HH:MM:SS'}, ... }
+    Files missing either stamp are omitted. Not every CHB-MIT patient provides
+    these lines (e.g. chb24) -> callers must fall back to single-file mode.
+    """
+    times = {}
+    current_file = None
+    with open(summary_path, 'r', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            fmatch = re.match(r'File Name:\s+(\S+\.edf)', line, re.IGNORECASE)
+            if fmatch:
+                current_file = fmatch.group(1).strip().lower()
+                times.setdefault(current_file, {})
+                continue
+            smatch = re.match(r'File Start Time:\s+([0-9]{1,3}:[0-9]{2}:[0-9]{2})',
+                              line, re.IGNORECASE)
+            if smatch and current_file:
+                times[current_file]['start'] = smatch.group(1)
+                continue
+            ematch = re.match(r'File End Time:\s+([0-9]{1,3}:[0-9]{2}:[0-9]{2})',
+                              line, re.IGNORECASE)
+            if ematch and current_file:
+                times[current_file]['end'] = ematch.group(1)
+                continue
+    return {k: v for k, v in times.items() if 'start' in v and 'end' in v}
+
+
+def parse_all_file_times(chbmit_root: str, logger=None) -> dict:
+    """
+    Walk the CHB-MIT root and return per-patient file clock stamps:
+        { 'chb01': { 'chb01_03.edf': {'start':..., 'end':...}, ... }, ... }
+    Patients/files without stamps are simply omitted (single-file fallback).
+    """
+    all_times = {}
+    for entry in sorted(os.listdir(chbmit_root)):
+        patient_dir = os.path.join(chbmit_root, entry)
+        if not os.path.isdir(patient_dir):
+            continue
+        if not re.match(r'chb\d+', entry, re.IGNORECASE):
+            continue
+        patient_id = entry.lower()
+        summary_file = None
+        for fname in os.listdir(patient_dir):
+            if 'summary' in fname.lower() and fname.endswith('.txt'):
+                summary_file = os.path.join(patient_dir, fname)
+                break
+        if summary_file is None:
+            continue
+        ft = parse_patient_file_times(summary_file)
+        if ft:
+            all_times[patient_id] = ft
+        if logger:
+            logger.info(f'[{patient_id}] file-time stamps parsed for {len(ft)} entries')
+    return all_times
+
+
 def parse_all_summaries(chbmit_root: str, logger) -> dict:
     """
     Walk the CHB-MIT root directory and parse every patient's summary file.
