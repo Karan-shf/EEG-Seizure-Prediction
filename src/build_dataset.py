@@ -46,6 +46,13 @@ CHBMIT_ROOT = 'data/raw/chb-mit'
 INTERICTAL_MIN_GAP = 3600
 MAX_INTERICTAL_PER_PATIENT = 10
 
+# Interictal windows are scanned across the patient timeline (when clock
+# stamps exist) or within each file (fallback), spaced by this stride and
+# clamped to at least the window duration so negatives never overlap.
+# Interictal windows use offset=0: the pre-ictal offset is meaningless when
+# there is no seizure to lead up to.
+INTERICTAL_STRIDE_FLOOR = 300  # seconds
+
 # TARGET_FRAMES is now computed per-config inside build_dataset(),
 # since it depends on that config's duration_minutes — no longer a
 # fixed global constant.
@@ -77,50 +84,38 @@ def get_patient_seizure_times(patient_data: dict) -> dict:
 
 
 def find_interictal_anchors(
-    raw_duration: float,
-    seizure_onsets: list,
+    scan_lo: float,
+    scan_hi: float,
+    seizure_times: list,
+    window_needed: float,
     min_gap: int = INTERICTAL_MIN_GAP,
     n_anchors: int = MAX_INTERICTAL_PER_PATIENT,
-    window_needed: float | None = None,   # must be passed explicitly,
+    stride: float | None = None,
 ) -> list:
     """
-    Find up to n_anchors time points within a recording that are at least
-    min_gap seconds away from every seizure onset, and have at least
-    window_needed seconds of EEG before them.
-
-    Parameters
-    ----------
-    raw_duration   : float — total duration of the recording in seconds
-    seizure_onsets : list  — list of seizure onset times in this recording
-    min_gap        : int   — minimum distance from any seizure (seconds)
-    n_anchors      : int   — maximum number of anchors to return
-    window_needed  : float — how many seconds before the anchor we need
-
-    Returns
-    -------
-    list of float anchor times (end of interictal window = anchor)
+    Find up to n_anchors anchor points (each the END of an interictal window)
+    inside [scan_lo, scan_hi] such that the whole window
+    [anchor - window_needed, anchor] stays at least min_gap seconds clear of
+    every seizure. Axis-agnostic: pass local file seconds with local onsets, or
+    absolute patient-timeline seconds with absolute onsets.
     """
-    if window_needed is None:
-        raise ValueError(
-            'window_needed must be explicitly passed as offset_sec + duration_sec'
-        )
-    
+    if stride is None:
+        stride = window_needed
+    stride = max(float(stride), float(INTERICTAL_STRIDE_FLOOR))
+
     anchors = []
-
-    # Candidate anchor points: every 30-minute mark through the recording
-    candidate_step = window_needed  # check every 30 minutes
-    t = window_needed  # first candidate: 30 minutes into the recording
-
-    while t <= raw_duration and len(anchors) < n_anchors:
-        # Check distance from every seizure in this file
-        too_close = any(
-            abs(t - onset) < min_gap
-            for onset in seizure_onsets
+    t = scan_lo + window_needed          # need `window_needed` of lead-in
+    while t <= scan_hi and len(anchors) < n_anchors:
+        win_lo = t - window_needed
+        # Reject if window [win_lo, t] overlaps the forbidden zone
+        # [onset - min_gap, onset + min_gap] of ANY seizure.
+        clash = any(
+            (win_lo < onset + min_gap) and (t > onset - min_gap)
+            for onset in seizure_times
         )
-        if not too_close:
+        if not clash:
             anchors.append(t)
-
-        t += candidate_step
+        t += stride
 
     return anchors
 
@@ -213,75 +208,138 @@ def process_preictal_event(
 
 def process_interictal_events(
     patient_id: str,
-    filename: str,
-    edf_path: str,
-    seizure_onsets: list,
-    inter_event_counter: list,   # mutable counter shared across calls
+    patient_data: dict,
+    seizure_times: dict,
+    patient_dir: str,
+    inter_event_counter: list,   # mutable [count] shared across the patient
     output_dir: str,
-    offset_sec: float,
+    offset_sec: float,           # accepted for symmetry; NOT used (see below)
     duration_sec: float,
     target_frames: int,
-    logger
+    logger,
+    timeline: dict | None = None,
 ) -> list:
     """
-    Extract interictal sequences from a recording file and save them.
-
-    Returns a list of metadata row dicts (one per saved sequence).
+    Collect interictal sequences for ONE patient. Windows are duration_sec of
+    quiet EEG ending at an anchor, extracted with offset=0. Anchors keep the
+    whole window >= INTERICTAL_MIN_GAP from every seizure. Uses the stitched
+    absolute timeline when available (this is what lets 45/60-min windows exist
+    at all); otherwise falls back to per-file scanning.
     """
     rows = []
-
-    try:
-        import mne
-        raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
-        raw_duration = raw.times[-1]
-    except Exception as e:
-        logger.info(f'  [ERROR reading {filename} for interictal] {e}')
+    budget = MAX_INTERICTAL_PER_PATIENT - inter_event_counter[0]
+    if budget <= 0:
         return rows
 
-    anchors = find_interictal_anchors(
-        raw_duration, 
-        seizure_onsets, 
-        n_anchors=1, 
-        window_needed=offset_sec + duration_sec
-    )
-
-    if not anchors:
-        logger.info(f'  [NO INTERICTAL] {patient_id} {filename} — no safe window found')
-        return rows
-
-    for anchor in anchors:
+    def _emit(source_edf, anchor, builder):
+        """Increment the counter, honour the on-disk cache, build+save."""
         inter_event_counter[0] += 1
         idx       = inter_event_counter[0]
         save_name = f'{patient_id}_inter{idx:02d}_interictal.npy'
         save_path = os.path.join(output_dir, save_name)
 
         if os.path.exists(save_path):
-            logger.info(f'  [SKIP — already exists] {save_name}')
+            logger.info(f'  [SKIP - already exists] {save_name}')
             seq = np.load(save_path)
-            rows.append(_make_metadata_row(
-                save_name, patient_id, filename, 'interictal', 0,
+            return _make_metadata_row(
+                save_name, patient_id, source_edf, 'interictal', 0,
                 anchor, seq.shape, note='cached'
-            ))
+            )
+        try:
+            sequence = builder()
+            np.save(save_path, sequence)
+            non_zero = int(np.any(sequence != 0, axis=(1, 2)).sum())
+            padded   = target_frames - non_zero
+            note     = f'padded_frames={padded}' if padded > 0 else 'full'
+            logger.info(f'  [SAVED] {save_name}  shape={sequence.shape}  ({note})')
+            return _make_metadata_row(
+                save_name, patient_id, source_edf, 'interictal', 0,
+                anchor, sequence.shape, note=note
+            )
+        except Exception as e:
+            logger.info(f'  [ERROR] interictal {patient_id} {source_edf} '
+                        f'anchor={anchor:.0f}s - {e}')
+            return None
+
+    # -- Timeline (stitched, absolute-axis) path ---------------------------
+    if timeline:
+        abs_seizures = []
+        for fname, onsets in seizure_times.items():
+            if fname in timeline:
+                base = timeline[fname]['abs_start']
+                abs_seizures.extend(base + o for o in onsets)
+
+        scan_lo = min(t['abs_start'] for t in timeline.values())
+        scan_hi = max(t['abs_end']   for t in timeline.values())
+
+        anchors = find_interictal_anchors(
+            scan_lo, scan_hi, abs_seizures,
+            window_needed=duration_sec,
+            n_anchors=budget,
+            stride=duration_sec,
+        )
+        if not anchors:
+            logger.info(f'  [NO INTERICTAL] {patient_id} - no safe window on '
+                        f'timeline (dur={duration_sec:.0f}s, '
+                        f'{len(abs_seizures)} seizures)')
+            return rows
+
+        for anchor in anchors:
+            def _build_stitched(a=anchor):
+                seq, _sfreq, _nch = build_sequence_multifile(
+                    timeline, patient_dir,
+                    abs_anchor=float(a),
+                    duration=float(duration_sec),
+                    offset=0.0,
+                    target_n_windows=target_frames,
+                    logger=logger,
+                )
+                return seq
+            row = _emit('(stitched)', anchor, _build_stitched)
+            if row:
+                rows.append(row)
+        return rows
+
+    # -- Single-file fallback (no clock stamps, e.g. chb24) ----------------
+    for filename, _seizures in sorted(patient_data.items()):
+        if inter_event_counter[0] >= MAX_INTERICTAL_PER_PATIENT:
+            break
+        edf_path = os.path.join(patient_dir, filename)
+        if not os.path.exists(edf_path):
+            continue
+        try:
+            import mne
+            raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
+            raw_duration = float(raw.times[-1])
+        except Exception as e:
+            logger.info(f'  [ERROR reading {filename} for interictal] {e}')
             continue
 
-        try:
-            sequence, sfreq, n_ch = build_sequence_from_edf(
-                edf_path,
-                anchor_time=float(anchor),
-                duration=float(duration_sec),
-                offset=float(offset_sec),
-                target_n_windows=target_frames,
-            )
-            np.save(save_path, sequence)
-            logger.info(f'  [SAVED] {save_name}  shape={sequence.shape}')
+        remaining = MAX_INTERICTAL_PER_PATIENT - inter_event_counter[0]
+        anchors = find_interictal_anchors(
+            0.0, raw_duration, seizure_times.get(filename, []),
+            window_needed=duration_sec,
+            n_anchors=remaining,
+            stride=duration_sec,
+        )
+        if not anchors:
+            logger.info(f'  [NO INTERICTAL] {patient_id} {filename} - '
+                        f'no safe window found')
+            continue
 
-            rows.append(_make_metadata_row(
-                save_name, patient_id, filename, 'interictal', 0,
-                anchor, sequence.shape, note='full'
-            ))
-
-        except Exception as e:
-            logger.info(f'  [ERROR] interictal {patient_id} {filename} anchor={anchor}s — {e}')
+        for anchor in anchors:
+            def _build_single(a=anchor, p=edf_path):
+                seq, _sfreq, _nch = build_sequence_from_edf(
+                    p,
+                    anchor_time=float(a),
+                    duration=float(duration_sec),
+                    offset=0.0,
+                    target_n_windows=target_frames,
+                )
+                return seq
+            row = _emit(filename, anchor, _build_single)
+            if row:
+                rows.append(row)
 
     return rows
 
@@ -475,25 +533,17 @@ def build_dataset(
             prev_local_off = ev['offset']
             prev_file      = filename
 
-        # --- Interictal sequences ---
-        for filename, seizures in sorted(patient_data.items()):
-            if inter_counter[0] >= MAX_INTERICTAL_PER_PATIENT:
-                break
-
-            edf_path = os.path.join(patient_dir, filename)
-            if not os.path.exists(edf_path):
-                continue
-
-            all_onsets_in_file = seizure_times.get(filename, [])
-            inter_rows = process_interictal_events(
-                patient_id, filename, edf_path,
-                all_onsets_in_file, inter_counter, output_dir,
-                offset_sec=offset_sec,
-                duration_sec=duration_sec,
-                target_frames=target_frames,
-                logger=logger
-            )
-            metadata_rows.extend(inter_rows)
+        # --- Interictal sequences (patient-level; stitched when possible) ---
+        inter_rows = process_interictal_events(
+            patient_id, patient_data, seizure_times, patient_dir,
+            inter_counter, output_dir,
+            offset_sec=offset_sec,
+            duration_sec=duration_sec,
+            target_frames=target_frames,
+            logger=logger,
+            timeline=timeline,
+        )
+        metadata_rows.extend(inter_rows)
 
     # --- Write metadata CSV ---
     logger.info(f'\n{"=" * 60}')
