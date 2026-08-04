@@ -67,6 +67,58 @@ MIN_AVAILABLE_SECS = 10
 # one file's end and the next file's start is within this tolerance (seconds).
 CONTIGUITY_TOLERANCE_SECS = 10.0
 
+# ---------------------------------------------------------------------------
+# F1 - Canonical channel montage (name-based, not raw index)
+# ---------------------------------------------------------------------------
+# CHB-MIT recordings vary in channel COUNT (22-38) and ORDER between patients
+# and even between files of the same patient. The old pipeline saved whatever
+# channels each EDF happened to contain and dataset.py sliced the first 17 by
+# raw index, so "channel 7" was a different electrode for different patients.
+# We fix this at build time: every window is projected onto the SAME fixed
+# 10-20 bipolar montage, in the SAME order, zero-filling any montage channel a
+# given file is missing. After this, channel i is always the same electrode.
+CANONICAL_CHANNELS = [
+    'FP1-F7', 'F7-T7', 'T7-P7', 'P7-O1',
+    'FP1-F3', 'F3-C3', 'C3-P3', 'P3-O1',
+    'FP2-F4', 'F4-C4', 'C4-P4', 'P4-O2',
+    'FP2-F8', 'F8-T8', 'T8-P8', 'P8-O2',
+    'FZ-CZ',  'CZ-PZ',
+]
+N_CANONICAL_CHANNELS = len(CANONICAL_CHANNELS)
+
+# Old (T3/T4/T5/T6) -> new (T7/T8/P7/P8) 10-20 electrode names, so files using
+# either nomenclature map onto the same canonical montage.
+_ELECTRODE_ALIASES = {'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8'}
+
+
+def _normalize_ch_name(name: str) -> str:
+    """Uppercase, strip, and apply old->new electrode aliases to a bipolar
+    channel name like 'fp1-f7' or 'T3-T4' so it matches CANONICAL_CHANNELS."""
+    parts = [p.strip() for p in str(name).upper().split('-')]
+    parts = [_ELECTRODE_ALIASES.get(p, p) for p in parts]
+    return '-'.join(parts)
+
+
+def canonicalize_channel_data(data: np.ndarray, ch_names: list) -> np.ndarray:
+    """
+    Project a (n_channels, n_samples) array onto the fixed CANONICAL_CHANNELS
+    montage BY NAME, returning (N_CANONICAL_CHANNELS, n_samples). Montage
+    channels absent from this file are zero-filled; duplicate names keep the
+    first occurrence. This is the core of Fix F1.
+    """
+    n_samples = data.shape[1]
+    out = np.zeros((N_CANONICAL_CHANNELS, n_samples), dtype=data.dtype)
+    name_to_row = {}
+    for i, ch in enumerate(ch_names):
+        key = _normalize_ch_name(ch)
+        if key not in name_to_row:      # first occurrence wins on duplicates
+            name_to_row[key] = i
+    for r, canon in enumerate(CANONICAL_CHANNELS):
+        src = name_to_row.get(canon)
+        if src is not None:
+            out[r] = data[src]
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Step 1 — Load and filter
@@ -165,6 +217,9 @@ def extract_segment(
 
     raw_segment = raw.copy().crop(tmin=segment_start, tmax=segment_end)
     data = np.asarray(raw_segment.get_data())  # shape: (n_channels, n_samples)
+
+    # F1: project onto the fixed canonical montage by channel name
+    data = canonicalize_channel_data(data, raw_segment.ch_names)
 
     return data, actual_duration
 
@@ -278,6 +333,10 @@ def extract_window_multifile(
             break
 
         data = np.asarray(raw.copy().crop(tmin=local_lo, tmax=local_hi).get_data())
+
+        # F1: project onto the fixed canonical montage by channel name so every
+        # stitched chunk shares identical channel semantics before concat.
+        data = canonicalize_channel_data(data, raw.ch_names)
 
         if ref_sfreq is None:
             ref_sfreq, ref_nch = sfreq, data.shape[0]

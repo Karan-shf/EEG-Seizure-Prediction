@@ -45,10 +45,11 @@ from torch.utils.data import Dataset, DataLoader
 # Number of frequency bands
 N_BANDS    = 5
 
-# Number of globally valid channels across all CHB-MIT patients
-# These are the 17 channels whose first electrode maps to a known
-# 10-20 scalp position in every patient's recording.
-N_CHANNELS = 17
+# Number of channels is now defined by the canonical montage in preprocessing
+# (Fix F1). build_dataset projects every window onto these channels in a fixed
+# order, so channel i is always the same electrode across patients/files.
+from preprocessing import CANONICAL_CHANNELS
+N_CHANNELS = len(CANONICAL_CHANNELS)
 
 # Fixed predetermined patient split
 # 17 train / 4 val / 3 test  (patient-level — no patient appears in two splits)
@@ -179,9 +180,11 @@ class SeizureDataset(Dataset):
         sequences_dir: str,
         patient_list: list,
         augment: bool = False,
+        norm_stats: dict | None = None,
     ):
         self.sequences_dir = sequences_dir
         self.augment       = augment
+        self.norm_stats    = norm_stats   # Fix F3: train-only (mean, std) or None
 
         # Filter metadata to only the requested patients
         self.meta = meta[meta['patient_id'].isin(patient_list)].reset_index(drop=True)
@@ -212,10 +215,15 @@ class SeizureDataset(Dataset):
         seq_path = os.path.join(self.sequences_dir, row['filename'])
         seq = np.load(seq_path)   # shape: (360, 5, n_channels)
 
-        # --- Restrict to N_CHANNELS globally valid channels ---
-        # Sequences may have more channels; we take the first N_CHANNELS
-        # which correspond to the consistently valid electrode positions
-        seq = seq[:, :, :N_CHANNELS]   # (360, 5, 17)
+        # --- Channels are already the canonical montage (Fix F1) ---
+        # build_dataset now saves exactly N_CHANNELS canonical channels in a
+        # fixed order. Slice/pad defensively in case an older cache is present.
+        if seq.shape[2] >= N_CHANNELS:
+            seq = seq[:, :, :N_CHANNELS]
+        else:
+            pad = np.zeros((seq.shape[0], seq.shape[1], N_CHANNELS - seq.shape[2]),
+                           dtype=seq.dtype)
+            seq = np.concatenate([seq, pad], axis=2)
 
         # --- Augmentation (training only) ---
         # Time-shift: randomly roll the sequence along the time axis
@@ -252,11 +260,16 @@ class SeizureDataset(Dataset):
                 drop_channels = np.random.choice(n_channels, size=n_drop, replace=False)
                 seq[:, :, drop_channels] = 0.0
 
-        # --- Instance normalisation (per channel per band) ---
-        # For each of the 17 channels and each of the 5 bands,
-        # compute mean and std across the 360 time frames and normalise.
-        # Only use non-zero frames to avoid padding corrupting statistics.
-        seq = _instance_normalise(seq)
+        # --- Normalisation (Fix F3: train-only global stats when available) ---
+        # If per-(band, channel) statistics fitted on the TRAINING split were
+        # supplied, standardise with those (no val/test leakage, shared scale
+        # across patients). Otherwise fall back to per-sequence instance
+        # normalisation (also leakage-free).
+        if self.norm_stats is not None:
+            seq = _global_normalise(seq, self.norm_stats['mean'],
+                                    self.norm_stats['std'])
+        else:
+            seq = _instance_normalise(seq)
 
         # --- Convert to tensor ---
         sequence_tensor = torch.tensor(seq, dtype=torch.float32)
@@ -288,6 +301,61 @@ class SeizureDataset(Dataset):
         print(f'[Dataset] Class weights — interictal: {w_interictal:.3f} | '
               f'preictal: {w_preictal:.3f}')
         return weights
+
+
+# ---------------------------------------------------------------------------
+# Fix F3 - train-only global normalisation
+# ---------------------------------------------------------------------------
+
+def fit_channel_stats(meta: pd.DataFrame, sequences_dir: str,
+                      train_patients: list) -> dict:
+    """
+    Compute per-(band, channel) mean and std over the TRAINING split only,
+    using non-zero (non-padded) frames. The same stats are applied to every
+    split so no validation/test information leaks into normalisation.
+    """
+    sub = meta[meta['patient_id'].isin(train_patients)]
+    sums = None
+    sqs  = None
+    count = 0
+    for fname in sub['filename']:
+        p = os.path.join(sequences_dir, fname)
+        if not os.path.exists(p):
+            continue
+        seq = np.load(p)
+        if seq.shape[2] >= N_CHANNELS:
+            seq = seq[:, :, :N_CHANNELS]
+        nz = seq.sum(axis=(1, 2)) != 0
+        if nz.sum() == 0:
+            continue
+        real = seq[nz]                      # (n_real, N_BANDS, N_CHANNELS)
+        if sums is None:
+            sums = real.sum(axis=0)
+            sqs  = (real ** 2).sum(axis=0)
+        else:
+            sums += real.sum(axis=0)
+            sqs  += (real ** 2).sum(axis=0)
+        count += real.shape[0]
+    if not count:
+        return {'mean': np.zeros((N_BANDS, N_CHANNELS), dtype=np.float32),
+                'std':  np.ones((N_BANDS, N_CHANNELS), dtype=np.float32)}
+    mean = (sums / count).astype(np.float32)
+    var  = (sqs / count) - mean ** 2
+    std  = np.sqrt(np.clip(var, 1e-12, None)).astype(np.float32)
+    std  = np.where(std < 1e-8, 1e-8, std).astype(np.float32)
+    return {'mean': mean, 'std': std}
+
+
+def _global_normalise(seq: np.ndarray, mean: np.ndarray,
+                      std: np.ndarray) -> np.ndarray:
+    """Standardise non-padded frames with pre-fitted (train-only) per-(band,
+    channel) statistics; padded (all-zero) frames stay zero."""
+    seq = seq.copy()
+    nz = seq.sum(axis=(1, 2)) != 0
+    if nz.sum() == 0:
+        return seq
+    seq[nz] = (seq[nz] - mean) / std
+    return seq
 
 
 # ---------------------------------------------------------------------------
@@ -361,9 +429,16 @@ def make_dataloaders(
     -------
     (train_loader, val_loader, test_loader)
     """
-    train_ds = SeizureDataset(meta, sequences_dir, train_patients, augment=True)
-    val_ds   = SeizureDataset(meta, sequences_dir, val_patients,   augment=False)
-    test_ds  = SeizureDataset(meta, sequences_dir, test_patients,  augment=False)
+    # Fix F3: fit normalisation statistics on the TRAINING patients only,
+    # then share them with val/test so no evaluation data leaks in.
+    norm_stats = fit_channel_stats(meta, sequences_dir, train_patients)
+
+    train_ds = SeizureDataset(meta, sequences_dir, train_patients, augment=True,
+                              norm_stats=norm_stats)
+    val_ds   = SeizureDataset(meta, sequences_dir, val_patients,   augment=False,
+                              norm_stats=norm_stats)
+    test_ds  = SeizureDataset(meta, sequences_dir, test_patients,  augment=False,
+                              norm_stats=norm_stats)
 
     train_loader = DataLoader(
         train_ds,

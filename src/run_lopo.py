@@ -28,7 +28,9 @@ from build_dataset import build_dataset
 from dataset import get_splits, make_dataloaders, infer_n_frames, FIXED_TEST_PATIENTS
 from model import ModelConfig
 from train import TrainConfig, train
-from evaluate import load_model, run_inference, compute_metrics, pick_threshold_youden
+from evaluate import (load_model, run_inference, compute_metrics,
+                      pick_threshold_youden, pick_threshold_fpr,
+                      TARGET_FPR_PER_HOUR)
 
 DATA_ROOT       = 'data/processed'
 CHECKPOINT_ROOT = 'experiments/checkpoints'
@@ -132,7 +134,9 @@ def run_one_config_lopo(offset_minutes: int, duration_minutes: int,
         val_probas = np.concatenate(pooled_val_p)
         val_labels = np.concatenate(pooled_val_y)
         if len(np.unique(val_labels)) == 2:
-            threshold = pick_threshold_youden(val_probas, val_labels)
+            threshold = pick_threshold_fpr(val_probas, val_labels,
+                                           n_frames=n_frames,
+                                           target_fpr_per_hour=TARGET_FPR_PER_HOUR)
         else:
             threshold = 0.5
     else:

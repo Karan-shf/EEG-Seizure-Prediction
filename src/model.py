@@ -79,7 +79,7 @@ class ModelConfig:
                         # a fixed value since duration varies across
                         # the offset/duration grid search
     n_bands:    int = 5
-    n_channels: int = 17
+    n_channels: int = 18   # canonical 10-20 bipolar montage (Fix F1)
 
     # CNN block
     cnn_filters_1: int = 32    # filters in first conv layer

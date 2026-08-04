@@ -78,6 +78,12 @@ THRESHOLD = 0.35
 WINDOW_SECONDS = 5
 STRIDE_SECONDS = 3
 
+# Fix F6: cap alarms by choosing the operating threshold under a false-alarm
+# budget (alarms per hour) instead of Youden's J, then optionally requiring
+# K consecutive positive windows before an alarm is raised.
+TARGET_FPR_PER_HOUR = 0.5
+ALARM_PERSISTENCE_K = 2
+
 DEVICE = (
     'mps'  if torch.backends.mps.is_available() else
     'cuda' if torch.cuda.is_available()          else
@@ -175,6 +181,61 @@ def pick_threshold_youden(probas: np.ndarray, labels: np.ndarray) -> float:
     best = int(np.argmax(tpr - fpr))
     t = float(thr[best])
     return t if np.isfinite(t) else 0.5   # roc_curve prepends an inf threshold
+
+
+def pick_threshold_fpr(probas: np.ndarray, labels: np.ndarray, n_frames: int,
+                       target_fpr_per_hour: float = TARGET_FPR_PER_HOUR) -> float:
+    """
+    Fix F6 - choose the LOWEST threshold (highest sensitivity) whose false-alarm
+    rate on this (validation) set stays within ``target_fpr_per_hour``. Falls
+    back to Youden's J if no threshold meets the budget (e.g. a model that fires
+    on everything).
+    """
+    labels = np.asarray(labels)
+    probas = np.asarray(probas)
+    n_interictal = int((labels == 0).sum())
+    if n_interictal == 0:
+        return pick_threshold_youden(probas, labels)
+
+    interictal_hours = (n_interictal * n_frames * STRIDE_SECONDS) / 3600.0
+    if interictal_hours <= 0:
+        return pick_threshold_youden(probas, labels)
+
+    n_pos = int((labels == 1).sum())
+    best_t = None
+    best_tpr = -1.0
+    for t in np.unique(probas):
+        preds = (probas >= t).astype(int)
+        fp = int(((preds == 1) & (labels == 0)).sum())
+        if fp / interictal_hours <= target_fpr_per_hour:
+            tp = int(((preds == 1) & (labels == 1)).sum())
+            tpr = tp / n_pos if n_pos else 0.0
+            # prefer more sensitivity within budget; break ties toward lower t
+            if tpr > best_tpr or (tpr == best_tpr and best_t is not None and t < best_t):
+                best_tpr = tpr
+                best_t = float(t)
+    if best_t is None:
+        return pick_threshold_youden(probas, labels)
+    return best_t
+
+
+def apply_alarm_persistence(preds: np.ndarray, k: int = ALARM_PERSISTENCE_K) -> np.ndarray:
+    """
+    Fix F6 - require K consecutive positive windows before raising an alarm.
+    ``preds`` must be in time order for a single patient/recording. Returns a
+    new binary array where a position is 1 only if it is part of a run of at
+    least K consecutive 1s. With k <= 1 this is a no-op.
+    """
+    preds = np.asarray(preds).astype(int)
+    if k <= 1 or preds.size == 0:
+        return preds
+    out = np.zeros_like(preds)
+    run = 0
+    for i, p in enumerate(preds):
+        run = run + 1 if p == 1 else 0
+        if run >= k:
+            out[i - k + 1:i + 1] = 1
+    return out
 
 # ---------------------------------------------------------------------------
 # Compute metrics
@@ -288,6 +349,32 @@ def compute_per_patient_metrics(results: dict, n_frames: int,
         })
 
     return pd.DataFrame(rows)
+
+
+def compute_pooled_zscored_auc(results: dict) -> float:
+    """
+    Fix F9 - pooled AUC after z-scoring each patient's probabilities using that
+    patient's own mean/std. This removes cross-patient score-scale offsets that
+    can drag the naive pooled AUC below every per-patient AUC.
+    """
+    probas = np.asarray(results['probas'], dtype=float)
+    labels = np.asarray(results['labels'])
+    pids   = np.asarray(results['patient_ids'])
+    z = np.zeros_like(probas)
+    for pid in np.unique(pids):
+        m = pids == pid
+        vals = probas[m]
+        sd = vals.std()
+        z[m] = (vals - vals.mean()) / sd if sd > 1e-8 else 0.0
+    if len(np.unique(labels)) < 2:
+        return float('nan')
+    return float(roc_auc_score(labels, z))
+
+
+def summarize_per_patient_auc(per_patient: pd.DataFrame) -> float:
+    """Fix F9 - macro-average of the per-patient AUCs that are computable."""
+    vals = [float(a) for a in per_patient['auc'] if a != 'N/A']
+    return float(np.mean(vals)) if vals else float('nan')
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +615,9 @@ def print_report(metrics: dict, per_patient: pd.DataFrame,
     logger.info("")
     logger.info('── Overall metrics (test patients) ─────────────────')
     logger.info(f'  ROC-AUC         : {metrics["auc"]:.4f}')
+    if 'mean_patient_auc' in metrics:
+        logger.info(f'  Mean per-pt AUC : {metrics["mean_patient_auc"]:.4f}  (Fix F9)')
+        logger.info(f'  Z-pooled AUC    : {metrics["auc_zpooled"]:.4f}  (Fix F9)')
     logger.info(f'  Sensitivity      : {metrics["sensitivity"]:.4f}  '
           f'({metrics["tp"]} / {metrics["tp"] + metrics["fn"]} preictal detected)')
     logger.info(f'  Specificity      : {metrics["specificity"]:.4f}  '
@@ -616,11 +706,16 @@ def evaluate(
     n_frames = results['attn_weights'].shape[1]
 
     # --- Calibrate threshold on VALIDATION (never on test) ---
-    # 0.35 was hardcoded and uncalibrated -> all-positive operating point.
+    # Fix F6: choose the operating point under a false-alarm budget
+    # (TARGET_FPR_PER_HOUR) rather than Youden's J, which was letting the
+    # threshold swing between never-fire and fire-on-everything.
     val_results = run_inference(model, val_loader, device)
     if len(np.unique(val_results['labels'])) == 2:
-        threshold = pick_threshold_youden(val_results['probas'], val_results['labels'])
-        logger.info(f'[Evaluate] Calibrated threshold on val set: {threshold:.3f}')
+        threshold = pick_threshold_fpr(
+            val_results['probas'], val_results['labels'],
+            n_frames=n_frames, target_fpr_per_hour=TARGET_FPR_PER_HOUR)
+        logger.info(f'[Evaluate] FPR-aware threshold on val set: {threshold:.3f} '
+                    f'(target <= {TARGET_FPR_PER_HOUR}/h)')
     else:
         logger.info(f'[Evaluate] Val set single-class — keeping threshold {threshold:.3f}')
 
@@ -629,6 +724,10 @@ def evaluate(
                                   n_frames=n_frames, threshold=threshold)
     per_patient = compute_per_patient_metrics(results, n_frames=n_frames,
                                               threshold=threshold)
+
+    # Fix F9: honest per-patient reporting alongside the pooled number.
+    metrics['mean_patient_auc'] = summarize_per_patient_auc(per_patient)
+    metrics['auc_zpooled']      = compute_pooled_zscored_auc(results)
 
     # --- Print report ---
     print_report(metrics, per_patient, checkpoint_path, logger)
