@@ -296,7 +296,12 @@ class SeizureDataset(Dataset):
         # already-minority preictal class and forced every prediction positive
         # (test specificity collapsed to 0.0).
         w_interictal  = 1.0
-        w_preictal    = self.n_interictal / self.n_preictal
+        # pos_weight = n_neg/n_pos corrects the *usual* imbalance (interictal
+        # majority). After F4 tiling the balance can invert (pre-ictal majority),
+        # making this < 1, which punishes false alarms harder than missed
+        # seizures and drives the model to never fire. Floor at 1.0 so positives
+        # are never penalised below neutral (bump to ~1.25 if still trigger-shy).
+        w_preictal    = max(1.0, self.n_interictal / self.n_preictal)
         weights = torch.tensor([w_interictal, w_preictal], dtype=torch.float32)
         print(f'[Dataset] Class weights — interictal: {w_interictal:.3f} | '
               f'preictal: {w_preictal:.3f}')

@@ -302,6 +302,9 @@ def process_interictal_events(
     if budget <= 0:
         return rows
 
+    # Clear each seizure's pre-ictal region (reaches back offset+duration) + buffer.
+    min_gap = max(1800, int(offset_sec + duration_sec + 600))
+
     def _emit(source_edf, anchor, builder):
         """Increment the counter, honour the on-disk cache, build+save."""
         inter_event_counter[0] += 1
@@ -356,11 +359,17 @@ def process_interictal_events(
         # Fix F5: spread anchors across the whole timeline instead of packing
         # them at the start — stride grows with the available span and budget.
         span = max(0.0, scan_hi - scan_lo)
-        diversify_stride = max(duration_sec, span / (budget + 1)) if budget > 0 else duration_sec
+        # Oversample: seizure clashes + F2 padding drops mean not every anchor
+        # yields a saved window, so request ~3x budget spread across the timeline
+        # and stop once `budget` negatives are SAVED (not merely attempted).
+        n_candidates     = max(budget * 3, budget)
+        diversify_stride = (max(duration_sec, span / (n_candidates + 1))
+                            if budget > 0 else duration_sec)
         anchors = find_interictal_anchors(
             scan_lo, scan_hi, abs_seizures,
             window_needed=duration_sec,
-            n_anchors=budget,
+            min_gap=min_gap,
+            n_anchors=n_candidates,
             stride=diversify_stride,
         )
         if not anchors:
@@ -370,6 +379,8 @@ def process_interictal_events(
             return rows
 
         for anchor in anchors:
+            if len(rows) >= budget:          # saved enough negatives for this patient
+                break
             def _build_stitched(a=anchor):
                 seq, _sfreq, _nch = build_sequence_multifile(
                     timeline, patient_dir,
@@ -404,6 +415,7 @@ def process_interictal_events(
         anchors = find_interictal_anchors(
             0.0, raw_duration, seizure_times.get(filename, []),
             window_needed=duration_sec,
+            min_gap=min_gap,
             n_anchors=remaining,
             stride=duration_sec,
         )
