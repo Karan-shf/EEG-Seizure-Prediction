@@ -99,7 +99,7 @@ def _normalize_ch_name(name: str) -> str:
     return '-'.join(parts)
 
 
-def canonicalize_channel_data(data: np.ndarray, ch_names: list) -> np.ndarray:
+def canonicalize_channel_data(data: np.ndarray, ch_names: list, logger=None, src_tag: str = '') -> np.ndarray:
     """
     Project a (n_channels, n_samples) array onto the fixed CANONICAL_CHANNELS
     montage BY NAME, returning (N_CANONICAL_CHANNELS, n_samples). Montage
@@ -113,10 +113,18 @@ def canonicalize_channel_data(data: np.ndarray, ch_names: list) -> np.ndarray:
         key = _normalize_ch_name(ch)
         if key not in name_to_row:      # first occurrence wins on duplicates
             name_to_row[key] = i
+    missing = []
     for r, canon in enumerate(CANONICAL_CHANNELS):
         src = name_to_row.get(canon)
         if src is not None:
             out[r] = data[src]
+        else:
+            missing.append(canon)       # row stays all zeros — now recorded
+    # Zero-filling >2 channels means a montage/name mismatch that silently
+    # destroys spatial signal (a prime cross-subject generalization killer).
+    if missing and logger is not None:
+        logger.info(f'  [MONTAGE] {src_tag} zero-filled {len(missing)}/'
+                    f'{N_CANONICAL_CHANNELS}: {missing} | had: {sorted(name_to_row)}')
     return out
 
 
@@ -163,6 +171,8 @@ def extract_segment(
     anchor_time: float,
     duration: float,
     offset: float = 0.0,
+    logger = None,
+    edf_path: str = '',
 ) -> tuple[np.ndarray, float]:
     """
     Extract a segment of EEG ending `offset` seconds before `anchor_time`,
@@ -219,7 +229,7 @@ def extract_segment(
     data = np.asarray(raw_segment.get_data())  # shape: (n_channels, n_samples)
 
     # F1: project onto the fixed canonical montage by channel name
-    data = canonicalize_channel_data(data, raw_segment.ch_names)
+    data = canonicalize_channel_data(data, raw_segment.ch_names, logger=logger, src_tag=os.path.basename(edf_path))
 
     return data, actual_duration
 
@@ -336,7 +346,7 @@ def extract_window_multifile(
 
         # F1: project onto the fixed canonical montage by channel name so every
         # stitched chunk shares identical channel semantics before concat.
-        data = canonicalize_channel_data(data, raw.ch_names)
+        data = canonicalize_channel_data(data, raw.ch_names, logger=logger, src_tag=fname)
 
         if ref_sfreq is None:
             ref_sfreq, ref_nch = sfreq, data.shape[0]
@@ -486,6 +496,7 @@ def build_sequence_from_edf(
     duration: float = PRE_ICTAL_SECS,
     offset: float = 0.0,
     target_n_windows: int | None = None,
+    logger = None,
 ) -> tuple:
     """
     Full pipeline: load EDF → filter → extract segment → compute sequence.
@@ -514,7 +525,7 @@ def build_sequence_from_edf(
     sfreq = raw.info['sfreq']
 
     segment_data, actual_duration = extract_segment(
-        raw, anchor_time, duration, offset=offset
+        raw, anchor_time, duration, offset=offset, logger=logger, edf_path=edf_path
     )
 
     # Compute target_n_windows from THIS call's duration if not provided,

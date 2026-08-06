@@ -436,8 +436,7 @@ def make_dataloaders(
     """
     # Fix F3: fit normalisation statistics on the TRAINING patients only,
     # then share them with val/test so no evaluation data leaks in.
-    # norm_stats = fit_channel_stats(meta, sequences_dir, train_patients)
-    norm_stats = None
+    norm_stats = fit_channel_stats(meta, sequences_dir, train_patients)
 
     train_ds = SeizureDataset(meta, sequences_dir, train_patients, augment=True,
                               norm_stats=norm_stats)

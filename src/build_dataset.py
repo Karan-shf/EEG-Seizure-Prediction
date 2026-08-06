@@ -233,6 +233,7 @@ def process_preictal_event(
                     duration=float(duration_sec),
                     offset=this_offset,
                     target_n_windows=target_frames,
+                    logger=logger,
                 )
         except ValueError as e:
             # Ran out of usable EEG this far back — stop tiling earlier.
@@ -432,6 +433,7 @@ def process_interictal_events(
                     duration=float(duration_sec),
                     offset=0.0,
                     target_n_windows=target_frames,
+                    logger=logger,
                 )
                 return seq
             row = _emit(filename, anchor, _build_single)
