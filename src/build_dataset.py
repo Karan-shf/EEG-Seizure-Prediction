@@ -61,7 +61,7 @@ PAD_FRACTION_MAX = 0.30
 # Instead of one window per seizure, tile up to PREICTAL_AUG_MAX windows across
 # each seizure's lead-in, each shifted earlier by (1 - overlap) x duration.
 # This multiplies the scarce positive class ~5x, reducing per-patient noise.
-PREICTAL_AUG_MAX     = 5
+PREICTAL_AUG_MAX     = 1
 PREICTAL_AUG_OVERLAP = 0.5    # 50% overlap -> stride = 0.5 x duration
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,25 @@ def get_patient_seizure_times(patient_data: dict) -> dict:
         fname: [s['onset'] for s in seizures]
         for fname, seizures in patient_data.items()
     }
+
+
+def _covered_intervals(timeline: dict, gap_tol: float = 1.0) -> list:
+    """
+    Merge per-file [abs_start, abs_end] spans into contiguous coverage runs.
+    Files separated by more than `gap_tol` seconds start a new run — the space
+    between runs is a recording gap where no EEG exists, so no interictal
+    window may be anchored there.
+    """
+    spans = sorted((t['abs_start'], t['abs_end']) for t in timeline.values())
+    if not spans:
+        return []
+    merged = [list(spans[0])]
+    for lo, hi in spans[1:]:
+        if lo <= merged[-1][1] + gap_tol:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, hi) for lo, hi in merged]
 
 
 def find_interictal_anchors(
@@ -354,25 +373,27 @@ def process_interictal_events(
                 base = timeline[fname]['abs_start']
                 abs_seizures.extend(base + o for o in onsets)
 
-        scan_lo = min(t['abs_start'] for t in timeline.values())
-        scan_hi = max(t['abs_end']   for t in timeline.values())
-
-        # Fix F5: spread anchors across the whole timeline instead of packing
-        # them at the start — stride grows with the available span and budget.
-        span = max(0.0, scan_hi - scan_lo)
-        # Oversample: seizure clashes + F2 padding drops mean not every anchor
-        # yields a saved window, so request ~3x budget spread across the timeline
-        # and stop once `budget` negatives are SAVED (not merely attempted).
-        n_candidates     = max(budget * 3, budget)
-        diversify_stride = (max(duration_sec, span / (n_candidates + 1))
-                            if budget > 0 else duration_sec)
-        anchors = find_interictal_anchors(
-            scan_lo, scan_hi, abs_seizures,
-            window_needed=duration_sec,
-            min_gap=min_gap,
-            n_anchors=n_candidates,
-            stride=diversify_stride,
-        )
+        # After
+        # Fix F5 (gap-aware): CHB-MIT has multi-hour clock gaps between EDF
+        # files. Scanning the full [scan_lo, scan_hi] span drops anchors inside
+        # those gaps ("No files overlap" errors) and starves/biases the
+        # interictal set. Restrict anchors to time actually covered by files,
+        # collect every gap-safe & seizure-clear candidate, then subsample
+        # evenly so windows are spread across the whole recording.
+        candidates = []
+        for lo, hi in _covered_intervals(timeline, gap_tol=1.0):
+            candidates.extend(find_interictal_anchors(
+                lo, hi, abs_seizures,
+                window_needed=duration_sec,
+                n_anchors=10**6,                       # collect all in this run
+                stride=max(duration_sec, INTERICTAL_STRIDE_FLOOR),
+            ))
+        candidates.sort()
+        if budget > 0 and len(candidates) > budget:
+            idx = np.linspace(0, len(candidates) - 1, budget).round().astype(int)
+            anchors = [candidates[i] for i in sorted(set(idx))]
+        else:
+            anchors = candidates[:budget] if budget > 0 else []
         if not anchors:
             logger.info(f'  [NO INTERICTAL] {patient_id} - no safe window on '
                         f'timeline (dur={duration_sec:.0f}s, '

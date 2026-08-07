@@ -457,20 +457,22 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, fold: tuple | None = N
         history['val_auc'].append(val_auc)
         history['lr'].append(current_lr)
 
-        # The fixed val set is tiny, so single-epoch val AUC swings 0.0 -> 1.0.
-        # Selecting on a 3-epoch trailing mean (plus a small margin) stops one
-        # lucky epoch from being saved as "best" (e.g. the epoch-3 AUC=1.0 fluke).
+        # After
+        # Select on the RAW per-epoch validation metric (z_pooled, already in
+        # val_auc) so a genuine peak epoch is actually captured. The old 3-epoch
+        # trailing mean smoothed real peaks away — last run it saved ep8
+        # (smoothed 0.595) instead of ep6 (raw z_pooled 0.650). Determinism plus
+        # the aggregate z_pooled metric (over all val patients, not a single
+        # pooled draw) make raw selection stable enough now; MIN_DELTA still
+        # blocks trivially-equal epochs.
         MIN_DELTA = 1e-3
-        recent = [a for a in history['val_auc'][-3:] if not np.isnan(a)]
-        smoothed_val_auc = (sum(recent) / len(recent)) if recent else float('nan')
-
         improved = ''
-        if not np.isnan(smoothed_val_auc) and smoothed_val_auc > best_val_auc + MIN_DELTA:
-            best_val_auc   = smoothed_val_auc
+        if not np.isnan(val_auc) and val_auc > best_val_auc + MIN_DELTA:
+            best_val_auc   = val_auc
             best_epoch     = epoch
             epochs_no_improve = 0
             history['best_epoch'] = epoch
-            save_checkpoint(model, optimizer, epoch, smoothed_val_auc,
+            save_checkpoint(model, optimizer, epoch, val_auc,
                             model_cfg, checkpoint_path)
             improved = '✓ best'
         else:
