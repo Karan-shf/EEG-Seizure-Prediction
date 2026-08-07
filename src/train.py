@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import json
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -101,11 +102,17 @@ class TrainConfig:
 # ---------------------------------------------------------------------------
 
 def set_seed(seed: int):
-    """Fix all random seeds for reproducibility."""
-    torch.manual_seed(seed)
+    """Fix all random seeds AND force deterministic kernels so runs are
+    byte-reproducible and A/B comparisons are valid."""
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Force deterministic cuDNN algorithms (conv + LSTM). benchmark=False stops
+    # cuDNN from auto-picking fast-but-nondeterministic kernels per input shape.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def save_checkpoint(model, optimizer, epoch, val_auc, config, path):
@@ -220,12 +227,29 @@ def validate(model, loader, criterion, device):
     all_labels = torch.cat(all_labels).numpy()
     probas     = 1 / (1 + np.exp(-all_logits))
 
+    # Pooled AUC (legacy — kept only for logging/comparison)
     if len(np.unique(all_labels)) > 1:
-        auc = roc_auc_score(all_labels, probas)
+        pooled_auc = roc_auc_score(all_labels, probas)
     else:
-        auc = float('nan')
+        pooled_auc = float('nan')
 
-    return avg_loss, auc
+    # Per-patient + z-pooled AUC (F9-consistent). val loader is shuffle=False,
+    # so predictions align with loader.dataset.meta row order.
+    patient_ids = loader.dataset.meta['patient_id'].to_numpy()
+    per_patient_aucs = []
+    z_scores = np.zeros_like(probas)
+    for pid in np.unique(patient_ids):
+        m = patient_ids == pid
+        p = probas[m]
+        z_scores[m] = (p - p.mean()) / (p.std() + 1e-8)   # per-patient z-score
+        if len(np.unique(all_labels[m])) > 1:
+            per_patient_aucs.append(roc_auc_score(all_labels[m], probas[m]))
+
+    mean_patient_auc = float(np.mean(per_patient_aucs)) if per_patient_aucs else float('nan')
+    zpooled_auc = (roc_auc_score(all_labels, z_scores)
+                   if len(np.unique(all_labels)) > 1 else float('nan'))
+
+    return avg_loss, pooled_auc, mean_patient_auc, zpooled_auc
 
 
 # ---------------------------------------------------------------------------
@@ -415,9 +439,12 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, fold: tuple | None = N
         train_loss, train_auc = train_one_epoch(
             model, train_loader, criterion, optimizer, device
         )
-        val_loss, val_auc = validate(
+        val_loss, pooled_auc, mean_patient_auc, zpooled_auc = validate(
             model, val_loader, criterion, device
         )
+        # F9: checkpoint / early-stop / LR on the per-patient-robust metric,
+        # not the pooled AUC (which inverts under per-patient scale drift).
+        val_auc = zpooled_auc if not np.isnan(zpooled_auc) else pooled_auc
 
         # ReduceLROnPlateau steps on the monitored validation metric
         scheduler.step(val_auc)
@@ -453,6 +480,8 @@ def train(train_cfg: TrainConfig, model_cfg: ModelConfig, fold: tuple | None = N
         logger.info(f'{epoch:>6} {train_loss:>11.4f} {val_loss:>10.4f} '
               f'{train_auc:>10.4f} {val_auc:>9.4f} '
               f'{current_lr:>10.2e}  {improved}')
+        logger.info(f'        val_auc detail — pooled={pooled_auc:.4f}  '
+              f'mean_patient={mean_patient_auc:.4f}  z_pooled={zpooled_auc:.4f}')
 
         # Early stopping
         if epochs_no_improve >= train_cfg.patience:
