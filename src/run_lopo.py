@@ -30,7 +30,9 @@ from model import ModelConfig
 from train import TrainConfig, train
 from evaluate import (load_model, run_inference, compute_metrics,
                       pick_threshold_youden, pick_threshold_fpr,
-                      TARGET_FPR_PER_HOUR)
+                      TARGET_FPR_PER_HOUR,
+                      compute_per_patient_metrics, compute_pooled_zscored_auc,
+                      summarize_per_patient_auc)
 
 DATA_ROOT       = 'data/processed'
 CHECKPOINT_ROOT = 'experiments/checkpoints'
@@ -145,6 +147,22 @@ def run_one_config_lopo(offset_minutes: int, duration_minutes: int,
     metrics = compute_metrics(test_probas, test_labels,
                               threshold=threshold, n_frames=n_frames)
 
+    # The pooled AUC above ranks raw probabilities from 24 SEPARATE fold-models
+    # (each on its own score scale) in one list, which collapses the number even
+    # when every patient is well-ranked internally. Report the honest cross-
+    # subject metrics too, using the per-prediction patient ids already gathered:
+    # macro-average per-patient AUC, and the F9 z-pooled AUC (per-patient
+    # z-scoring removes the cross-patient/model offsets).
+    results = {
+        'probas':      np.asarray(test_probas, dtype=float),
+        'labels':      np.asarray(test_labels),
+        'patient_ids': np.asarray(test_pat),
+    }
+    per_patient = compute_per_patient_metrics(results, n_frames=n_frames,
+                                              threshold=threshold)
+    mean_pt_auc = summarize_per_patient_auc(per_patient)
+    zpooled_auc = compute_pooled_zscored_auc(results)
+
     out_dir = os.path.join(RESULTS_ROOT, config_name, 'lopo')
     os.makedirs(out_dir, exist_ok=True)
     save = {k: v for k, v in metrics.items()
@@ -152,6 +170,9 @@ def run_one_config_lopo(offset_minutes: int, duration_minutes: int,
     save.update({
         'config_name': config_name,
         'strategy': 'pooled_lopo',
+        'auc_pooled':       float(metrics['auc']),
+        'auc_mean_patient': float(mean_pt_auc),
+        'auc_zpooled':      float(zpooled_auc),
         'threshold': float(threshold),
         'n_test_total': int(test_labels.size),
         'n_test_pos': int((test_labels == 1).sum()),
@@ -161,9 +182,20 @@ def run_one_config_lopo(offset_minutes: int, duration_minutes: int,
         json.dump(save, f, indent=2)
     pd.DataFrame(fold_rows).to_csv(
         os.path.join(out_dir, 'lopo_per_fold.csv'), index=False)
+    per_patient.to_csv(
+        os.path.join(out_dir, 'lopo_per_patient.csv'), index=False)
+    # Persist raw pooled predictions so any metric can be recomputed WITHOUT
+    # retraining all 24 folds again.
+    pd.DataFrame({
+        'patient_id': np.asarray(test_pat),
+        'proba':      np.asarray(test_probas, dtype=float),
+        'label':      np.asarray(test_labels),
+    }).to_csv(os.path.join(out_dir, 'lopo_pooled_predictions.csv'), index=False)
 
     print(f'\n[{config_name}] POOLED LOPO  '
-          f"AUC={metrics['auc']:.3f}  sens={metrics['sensitivity']:.3f}  "
+          f"pooled_AUC={metrics['auc']:.3f}  mean_patient_AUC={mean_pt_auc:.3f}  "
+          f"z_pooled_AUC={zpooled_auc:.3f}\n"
+          f"                    sens={metrics['sensitivity']:.3f}  "
           f"spec={metrics['specificity']:.3f}  FPR/h={metrics['fpr_per_hour']:.2f}  "
           f'(thr={threshold:.3f}, pos={save["n_test_pos"]}/{save["n_test_total"]})')
     print(f'  saved -> {out_dir}/lopo_metrics.json')
