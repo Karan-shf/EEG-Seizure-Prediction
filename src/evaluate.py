@@ -95,7 +95,7 @@ DEVICE = (
 # Load checkpoint
 # ---------------------------------------------------------------------------
 
-def load_model(checkpoint_path: str, logger) -> SeizurePredictor:
+def load_model(checkpoint_path: str, logger=None) -> SeizurePredictor:
     """Load the best saved model from checkpoint."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
@@ -104,8 +104,12 @@ def load_model(checkpoint_path: str, logger) -> SeizurePredictor:
         )
 
     ckpt = torch.load(checkpoint_path, map_location='cpu')
-    logger.info(f'Loaded checkpoint from epoch {ckpt["epoch"]} '
-          f'(val AUC = {ckpt["val_auc"]:.4f})')
+    msg = (f'Loaded checkpoint from epoch {ckpt["epoch"]} '
+           f'(val AUC = {ckpt["val_auc"]:.4f})')
+    if logger is not None:
+        logger.info(msg)
+    else:
+        print(msg)
 
     config = ModelConfig(**ckpt['model_config'])
     model  = SeizurePredictor(config)
