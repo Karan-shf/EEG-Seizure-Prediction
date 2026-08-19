@@ -2,12 +2,15 @@
 montage.py
 ==========
 The canonical 18-channel bipolar montage (Req A) and channel-resolution logic.
+Maps whatever channels an EDF contains onto our fixed 18-channel montage, in a
+fixed order, so features stay comparable across patients.
 
-Different CHB-MIT EDF files list their channels in different orders, sometimes
-include extra channels (ECG, VNS, dummy '-' channels), use duplicate names (MNE
-renames a second 'T8-P8' to 'T8-P8-1'), and vary in capitalization. This module
-maps whatever an EDF provides onto our fixed 18-channel montage, in a fixed
-order, so every covariance matrix is indexed identically across patients.
+Pivot note (19 Aug 2026): the pipeline no longer builds a single cross-channel
+covariance matrix. Each channel is turned into its OWN RSMMTN SPD matrix, and
+the per-(channel, span) tangent feature blocks are concatenated in this fixed
+channel order. A stable order is therefore still essential -- it now guarantees
+that feature block k always refers to the same electrode pair across every
+patient, rather than indexing a covariance row/column.
 """
 
 from __future__ import annotations
@@ -93,8 +96,8 @@ if __name__ == "__main__":
 
     # 1. Canonical channels, one lowercased, plus junk + duplicate, shuffled.
     avail = list(CANONICAL_CHANNELS)
-    avail[0] = avail[0].lower()                   # case-insensitive match
-    avail += ["ECG", "VNS", "T8-P8-1", "-"]        # junk + duplicate suffix
+    avail[0] = avail[0].lower()
+    avail += ["ECG", "VNS", "T8-P8-1", "-"]
     random.Random(cfg.SEED).shuffle(avail)
 
     picks, missing = find_channel_indices(avail)
