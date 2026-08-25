@@ -89,3 +89,6 @@ experiments/checkpoints/*
 __pycache__/
 *.py[cod]
 *$py.class
+
+# docs
+docs/*

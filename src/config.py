@@ -6,9 +6,9 @@ Single source of truth for the SeizureHorizon rebuild.
 Every constant that any other module needs -- file paths, sampling rate, the
 canonical channel montage, the single cleanup filter, windowing geometry, the
 RSMMTN spatio-temporal feature definition, per-(channel x span) Riemannian
-recentering, in-fold PCA sizing, the SPH/SOP labeling + recording-continuity
-scheme, classifier hyper-parameters and evaluation settings -- is defined here
-and ONLY here.
+recentering, the Distance-to-References feature reduction, the SPH/SOP labeling
++ recording-continuity scheme, class-balancing, classifier hyper-parameters and
+evaluation settings -- is defined here and ONLY here.
 
 Design rule: no other file may hard-code a magic number that belongs to the
 pipeline definition. If a value is part of the experimental design (A-I in the
@@ -16,10 +16,18 @@ design doc), it lives in this file so a single edit propagates everywhere and
 so every experiment is fully described by this one module.
 
 Pivot note (19 Aug 2026): the Riemannian covariance / 5-band filter-bank stream
-is retired. Features are now alpha-blended multi-span RSMMTN transition networks
--- one SPD matrix per (channel, span) -- recentered per (channel x span) per
-patient, projected to the tangent space, and reduced with in-fold PCA. See the
-design doc sections C/D/E and the RSMMTN pivot banner.
+is retired. Features are alpha-blended multi-span RSMMTN transition networks --
+one SPD matrix per (channel, span) -- recentered per (channel x span) per
+patient.
+
+Pivot note v2 (25 Aug 2026): the tangent-vectorize -> in-fold PCA path is
+RETIRED (it produced a dense ~2.6M-wide per-window vector: memory-infeasible).
+Each recentered SPD matrix is instead reduced to 3 geodesic DISTANCES to
+physically meaningful anchors (own baseline, pooled interictal mean, pooled
+preictal mean) -> 3 x span x 18 = 486 features/window at m=9. Class imbalance
+is handled by cluster-centroid undersampling -> Borderline-SMOTE, and the
+classifier is Elastic-Net Logistic Regression. See design doc sections 3-5 and
+the RSMMTN Pipeline v2 note.
 """
 
 from __future__ import annotations
@@ -64,9 +72,9 @@ FS: int = 256  # CHB-MIT sampling rate (Hz), identical for every recording.
 # Canonical 18 bipolar channels, in FIXED order. Every EDF is reduced to
 # exactly this montage (see preprocessing/montage.py). Order matters: post-pivot
 # each channel becomes its OWN RSMMTN SPD matrix, and the per-(channel, span)
-# tangent feature blocks are concatenated in THIS order -- so feature block k
-# always refers to the same electrode pair across patients. (There is no longer
-# a single cross-channel covariance matrix.)
+# distance features are laid out in THIS order -- so feature block k always
+# refers to the same electrode pair across patients. (There is no longer a
+# single cross-channel covariance matrix.)
 CHANNELS: tuple[str, ...] = (
     "FP1-F7", "F7-T7", "T7-P7", "P7-O1",
     "FP1-F3", "F3-C3", "C3-P3", "P3-O1",
@@ -135,14 +143,11 @@ SPD_DIM: int = N_SYMBOLS
 # transition (adjacency) matrix for span i. The + I guarantees the matrix is
 # SPD and well-conditioned even when the 180x180 network is sparsely populated.
 
-# Tangent-space vector length of a symmetric d x d matrix = d(d+1)/2.
-TANGENT_DIM_PER_CHANNEL_SPAN: int = SPD_DIM * (SPD_DIM + 1) // 2   # 16290
-
 # --- alpha spatio-temporal blend [Req D] ---
 # y(t) = alpha * d2X_c(t) + (1 - alpha) * L_c(t) ; x(t) = X_c(t).
 # alpha = 1 -> temporal-only (paper), alpha = 0 -> spatial-only, else blend.
-# Each alpha is a FULLY INDEPENDENT experiment (own recentering / tangent /
-# concat / PCA / LR / LOPO). alpha features are NEVER concatenated across alpha.
+# Each alpha is a FULLY INDEPENDENT experiment (own recentering / anchors /
+# distances / LR / LOPO). alpha arms are NEVER concatenated across alpha.
 ALPHA_GRID: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 # --- multi-span cumulative roof [Req D] ---
@@ -170,28 +175,46 @@ LAPLACIAN_K_SANITY: tuple[int, ...] = (4, 6)
 
 # --- per-(channel x span) Riemannian recentering [Req E] ---
 # G_{patient,c,i} = RiemannianMean(C_i over that patient's INTERICTAL epochs
-# only, label-free); C' = G^-1/2 . C . G^-1/2 ; tangent v = vec(logm(C')) at I.
-# Calibration epochs are held DISJOINT from scored epochs. Honesty caveat: this
-# is unsupervised domain adaptation / calibration, NOT strict zero-shot.
+# only, label-free); C' = G^-1/2 . C . G^-1/2. Calibration epochs are held
+# DISJOINT from scored epochs. Honesty caveat: this is unsupervised domain
+# adaptation / calibration, NOT strict zero-shot. Post-recenter, the window's
+# own baseline sits at the identity I, so d_baseline = deltaR(C', I) measures
+# how far the window deviates from that patient's normal.
 RECENTER_METHOD: str = "riemannian_recenter"   # RCT-analogue, now at 180 x 180
 RECENTER_GRANULARITY: str = "channel_span"     # one anchor per (channel, span)
 RECENTER_ANCHOR_STATE: str = "interictal"      # label-free calibration only
 
-# --- in-fold dimensionality reduction [Req D] ---
-# Fit ONLY on training-fold patients; transform the held-out patient. Reduce
-# along the (channel x span x feature) tensor to tame the ~2.6M-wide roof.
-DROP_ZERO_VARIANCE: bool = True                # remove dead / near-constant dims
-VARIANCE_THRESHOLD: float = 1e-12              # (do NOT blind z-score dead dims)
-PCA_PER_BLOCK_MAX_COMPONENTS: int = 130        # ~ effective-rank ceiling of the SPD
-GLOBAL_PCA_ENABLED: bool = True                # optional second stage
-GLOBAL_PCA_MAX_COMPONENTS: int | None = None   # None -> chosen train/val-only
-PCA_FIT_SCOPE: str = "train_fold_only"
-USE_INCREMENTAL_PCA: bool = True               # for very large window counts
+# --- Distance-to-References features [Req C/E, v2] ---
+# v2 pivot (25 Aug 2026): the tangent-vectorize -> in-fold PCA path is RETIRED
+# (a dense ~2.6M-wide per-window vector; see design doc section 3). Instead,
+# each window's recentered SPD matrix C' (per channel, per span) is reduced to
+# a SMALL set of geodesic distances to physically meaningful anchors:
+#   d_baseline   = deltaR(C', I)                 # deviation from own baseline
+#   d_interictal = deltaR(C', M_interictal_ci)   # to pooled source interictal mean
+#   d_preictal   = deltaR(C', M_preictal_ci)     # to pooled source preictal mean
+# deltaR = affine-invariant Riemannian metric (AIRM):
+#   deltaR(P, Q) = || log( eigvals( P^-1 Q ) ) ||_2
+N_REFERENCES: int = 3             # baseline (I), interictal mean, preictal mean
+REFERENCE_NAMES: tuple[str, ...] = ("baseline", "interictal", "preictal")
+RIEMANN_METRIC: str = "airm"      # affine-invariant Riemannian metric
+
+# The two population anchors (M_interictal, M_preictal) are Riemannian (Frechet)
+# means, computed per (channel x span) from TRAINING-fold (source) patients only
+# -- pooled AFTER each source patient's windows are recentered to their own
+# G_patient -- and recomputed fresh inside every LOPO fold. G_patient itself is
+# patient-local (that patient's own interictal windows) and may be formed for
+# the held-out patient too (uses only their own unlabeled baseline).
+RIEMANN_MEAN_MAX_ITER: int = 50
+RIEMANN_MEAN_TOL: float = 1e-6
+ANCHOR_SCOPE: str = "train_fold_only"    # M_interictal / M_preictal: source patients only
 
 
 def feature_dim(span_roof: int) -> int:
-    """Pre-reduction feature width for a given cumulative span roof m."""
-    return TANGENT_DIM_PER_CHANNEL_SPAN * span_roof * N_CHANNELS
+    """Distance-to-reference feature width for a cumulative span roof m.
+
+    = N_REFERENCES (3) x span_roof (m) x N_CHANNELS (18).  486 at m = 9.
+    """
+    return N_REFERENCES * span_roof * N_CHANNELS
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +227,29 @@ SOP_GRID_MINUTES: tuple[int, ...] = (15, 30, 45, 60)  # Seizure Occurrence Perio
 SOP_PRIMARY_MINUTES: int = 30         # headline operating point
 SOP_ASPIRATIONAL_MINUTES: int = 60    # the "1 hour ahead" stretch goal
 
-# Data hygiene (Req G): drop noisy / non-independent segments.
-POSTICTAL_SECONDS: int = 3 * 3600     # exclude 3 h after each seizure ends
+# Data hygiene (Req G, v2): symmetric seizure-exclusion buffer.
+# v2 adopts Truong et al. 2018's convention: interictal windows must sit at
+# least 4 h from ANY seizure in BOTH directions (pre and post). This replaces
+# the previous asymmetric 4 h pre-guard / 3 h postictal split with a single
+# symmetric +/- 4 h buffer.
+SEIZURE_EXCLUSION_SECONDS: int = 4 * 3600   # +/- 4 h symmetric (Truong 2018)
+POSTICTAL_SECONDS: int = SEIZURE_EXCLUSION_SECONDS       # 4 h after each seizure ends
+INTERICTAL_GUARD_SECONDS: int = SEIZURE_EXCLUSION_SECONDS  # 4 h before any seizure
 # A seizure is a usable "lead" seizure only if preceded by at least this much
 # seizure-free EEG (otherwise it is part of a cluster / not independent).
 LEAD_SEIZURE_MIN_PRECEDING_SECONDS: int = 4 * 3600
-# Interictal windows must sit at least this far from ANY seizure.
-INTERICTAL_GUARD_SECONDS: int = 4 * 3600
+
+# --- Interictal candidate-pool subsampling [Req F, v2] ---
+# CHB-MIT has ~40 h/patient; computing the full matrix pipeline for every
+# possible interictal window is intractable and unnecessary (and not what
+# published CHB-MIT work does). Instead, subsample a GENEROUS pool from the
+# "safe" interictal zone (outside every seizure's +/- 4 h exclusion) -- large
+# enough for stable anchor estimation and to give the balancing step real
+# diversity. Do NOT collapse to a class ratio here; balancing happens later,
+# in-fold, on the small 486-D distance features.
+INTERICTAL_POOL_MULTIPLIER: float = 5.0   # pool ~= 5 x the preictal window count
+INTERICTAL_POOL_STRATIFY: str = "recording_file"  # spread across files / time-of-day
+INTERICTAL_POOL_SEED: int = SEED
 
 # --- Recording continuity (Req G, critical) ---
 # CHB-MIT gives each patient as one continuous recording chopped into ~1 h EDFs
@@ -219,7 +258,19 @@ INTERICTAL_GUARD_SECONDS: int = 4 * 3600
 # per-patient GLOBAL timeline stitched from File Start/End clocks
 # (summary_parser handles midnight-wrap). Because RSMMTN is order-sensitive, a
 # window / transition must NEVER cross an inter-file gap.
-INTER_FILE_GAP_TOLERANCE_SECONDS: float = 0.0   # >0 gap => hard break (conservative; TBD)
+#
+# INTER_FILE_GAP_TOLERANCE_SECONDS is the MERGE threshold used when building a
+# patient's CONTIGUOUS SEGMENTS from consecutive EDFs:
+#   * gap <= tolerance  -> the two files join into ONE contiguous segment
+#                          (samples concatenated / treated as continuous; only
+#                          a few windows may straddle the sub-tolerance seam).
+#   * gap  > tolerance  -> HARD BREAK: a new segment starts and no window or
+#                          transition ever spans it.
+# It NEVER drops a file -- every file is always used; the tolerance only moves
+# where segment boundaries fall. 10 s absorbs the routine few-second gaps
+# between CHB-MIT files (summary clocks have 1 s resolution) while still
+# treating genuine multi-minute / hour pauses as hard breaks.
+INTER_FILE_GAP_TOLERANCE_SECONDS: float = 10.0
 # Patients whose summaries lack wall clocks cannot get an absolute timeline;
 # fall back to concatenation by EDF sample counts, gaps = unknown hard breaks.
 PATIENTS_WITHOUT_CLOCKS: tuple[str, ...] = ("chb24",)
@@ -230,20 +281,34 @@ LABEL_PREICTAL: int = 1
 
 
 # ---------------------------------------------------------------------------
-# 7. Classifier  [Req F]
+# 7. Classifier + class balancing  [Req F]
 # ---------------------------------------------------------------------------
 PRIMARY_CLASSIFIER: str = "lr"
-# Benchmarks evaluated on TRAIN folds only (never used to pick the final model
-# on test patients).
+# lr / lda / svm_rbf act on the 486-D distance features; mdm / fgmdm are
+# manifold-native sanity checks that operate directly on the SPD matrices. All
+# benchmarks are evaluated on TRAIN folds only (never used to pick the final
+# model on test patients).
 BENCHMARK_CLASSIFIERS: tuple[str, ...] = ("lr", "lda", "svm_rbf", "mdm", "fgmdm")
 
+# v2: Elastic-Net-regularized Logistic Regression on the standardized 486-D
+# distance features. Elastic-Net (L1 + L2) keeps L1's sparse feature selection
+# -- an interpretable readout of which (channel, span, reference) combos matter
+# for seizure localization -- while L2's grouping effect stabilizes that
+# selection across LOPO folds given the correlated distance features. Requires
+# the saga solver. Class balance is handled UPSTREAM by resampling (to 1:1),
+# so no class_weight is applied here.
 LR_PARAMS: dict = {
-    "C": 1.0,
-    "class_weight": "balanced",  # Req F: interictal >> preictal imbalance
-    "max_iter": 1000,
-    "solver": "liblinear",
+    "penalty": "elasticnet",
+    "solver": "saga",          # only saga supports elasticnet
+    "l1_ratio": 0.5,           # default; tuned train/val-only over L1_RATIO_GRID
+    "C": 1.0,                  # default; tuned train/val-only over C_GRID
+    "class_weight": None,      # balancing done via resampling, not weights
+    "max_iter": 5000,          # saga needs more iterations to converge
     "random_state": SEED,
 }
+L1_RATIO_GRID: tuple[float, ...] = (0.2, 0.5, 0.8)   # train/val-only tuning
+C_GRID: tuple[float, ...] = (0.1, 1.0, 10.0)         # train/val-only tuning
+
 SVM_PARAMS: dict = {
     "C": 1.0,
     "kernel": "rbf",
@@ -253,12 +318,26 @@ SVM_PARAMS: dict = {
     "random_state": SEED,
 }
 
-# Optional SMOTE oversampling (Req F: default OFF; class_weight is primary).
-USE_SMOTE: bool = False
+# --- Class imbalance handling [Req F, v2] ---
+# STRICT ORDER (train fold only; never touches the held-out patient):
+#   1. real, imbalanced 486-D features
+#   2. cluster-centroid UNDER-sample interictal -> 2:1 (interictal:preictal)
+#   3. Borderline-SMOTE OVER-sample preictal    -> 1:1
+#   4. fit the classifier
+# Anchors + raw features MUST be computed on real, unbalanced data first;
+# balancing on synthetic / pre-thinned data would corrupt the anchors' meaning.
+# The held-out patient is NEVER balanced (evaluated on its natural distribution).
+USE_RESAMPLING: bool = True
+UNDERSAMPLE_METHOD: str = "cluster_centroids"
+# interictal:preictal ratio AFTER cluster-centroid undersampling (2:1).
+UNDERSAMPLE_INTERICTAL_TO_PREICTAL_RATIO: float = 2.0
+OVERSAMPLE_METHOD: str = "borderline_smote"
+# interictal:preictal ratio AFTER Borderline-SMOTE (1:1).
+OVERSAMPLE_TARGET_RATIO: float = 1.0
+BALANCING_SCOPE: str = "train_fold_only"
 
-# Per-alpha standardization before classification. Applied IN-FOLD and only
-# AFTER the variance-threshold step (blind z-scoring near-zero-variance dead
-# dims would blow them up).
+# Per-alpha standardization (z-score) of the 486-D features. Fit IN-FOLD on
+# training data only, applied to the held-out patient.
 STANDARDIZE_FEATURES: bool = True
 
 
@@ -288,8 +367,8 @@ THRESHOLD_SELECTION: str = "train_val_fixed_fpr"
 def summary() -> str:
     """Return a human-readable dump of the most important derived settings."""
     return "\n".join([
-        "SeizureHorizon configuration (RSMMTN spatio-temporal)",
-        "=====================================================",
+        "SeizureHorizon configuration (RSMMTN spatio-temporal, v2)",
+        "=========================================================",
         f"Sampling rate            : {FS} Hz",
         f"Channels                 : {N_CHANNELS} ({', '.join(CHANNELS[:4])}, ...)",
         f"Cleanup band-pass        : {BANDPASS_LOW_HZ}-{BANDPASS_HIGH_HZ} Hz "
@@ -300,17 +379,21 @@ def summary() -> str:
         f"({int(WINDOW_OVERLAP*100)}% overlap)",
         f"RSMMTN symbols           : {N_ANGULAR_BINS} x {N_RADIAL_BINS} = {N_SYMBOLS} "
         f"(SPD {SPD_DIM}x{SPD_DIM})",
-        f"Tangent dim / ch / span  : {TANGENT_DIM_PER_CHANNEL_SPAN}",
         f"alpha grid               : {ALPHA_GRID}",
         f"Span roof grid           : {SPAN_ROOF_GRID} (max {SPAN_MAX})",
         f"Spatial Laplacian        : weighted graph, k={LAPLACIAN_K} ({LAPLACIAN_DISTANCE})",
         f"Recentering              : {RECENTER_GRANULARITY} ({RECENTER_ANCHOR_STATE} anchor)",
-        f"Pre-reduction dim @m={SPAN_MAX}   : {feature_dim(SPAN_MAX):,}",
-        f"Per-block PCA max        : {PCA_PER_BLOCK_MAX_COMPONENTS}",
+        f"References / window      : {N_REFERENCES} {REFERENCE_NAMES}",
+        f"Feature dim @m={SPAN_MAX}        : {feature_dim(SPAN_MAX):,} "
+        f"(= {N_REFERENCES} x {SPAN_MAX} x {N_CHANNELS})",
         f"SPH                      : {SPH_MINUTES} min",
         f"SOP grid                 : {SOP_GRID_MINUTES} min (primary {SOP_PRIMARY_MINUTES})",
-        f"Postictal exclusion      : {POSTICTAL_SECONDS // 3600} h",
-        f"Primary classifier       : {PRIMARY_CLASSIFIER}",
+        f"Seizure exclusion        : +/- {SEIZURE_EXCLUSION_SECONDS // 3600} h (symmetric)",
+        f"Interictal pool          : {INTERICTAL_POOL_MULTIPLIER}x preictal count",
+        f"Balancing                : {UNDERSAMPLE_METHOD} -> "
+        f"{UNDERSAMPLE_INTERICTAL_TO_PREICTAL_RATIO:.0f}:1 -> {OVERSAMPLE_METHOD} -> 1:1",
+        f"Classifier               : {PRIMARY_CLASSIFIER} "
+        f"({LR_PARAMS['penalty']}, solver={LR_PARAMS['solver']})",
         f"CV scheme                : {CV_SCHEME}",
     ])
 
@@ -340,7 +423,7 @@ if __name__ == "__main__":
     # --- RSMMTN symbol / SPD geometry ---
     assert N_SYMBOLS == 180
     assert N_ANGULAR_BINS * N_RADIAL_BINS == N_SYMBOLS
-    assert TANGENT_DIM_PER_CHANNEL_SPAN == 16290, TANGENT_DIM_PER_CHANNEL_SPAN
+    assert SPD_DIM == 180
 
     # --- alpha grid: independent runs spanning spatial(0)..temporal(1) ---
     assert ALPHA_GRID[0] == 0.0 and ALPHA_GRID[-1] == 1.0
@@ -355,9 +438,12 @@ if __name__ == "__main__":
     assert LAPLACIAN_K >= 1
     assert LAPLACIAN_K in LAPLACIAN_K_SANITY
 
-    # --- feature width sanity (~2.6M at m=9) ---
-    assert feature_dim(9) == 16290 * 9 * 18
-    assert feature_dim(1) == TANGENT_DIM_PER_CHANNEL_SPAN * N_CHANNELS
+    # --- Distance-to-References feature width (486 at m=9) ---
+    assert N_REFERENCES == 3
+    assert len(REFERENCE_NAMES) == N_REFERENCES
+    assert feature_dim(9) == N_REFERENCES * 9 * N_CHANNELS == 486
+    assert feature_dim(1) == N_REFERENCES * N_CHANNELS == 54
+    assert feature_dim(5) == 270
 
     # --- labeling ---
     assert SPH_SECONDS == 300
@@ -366,13 +452,30 @@ if __name__ == "__main__":
     assert SOP_ASPIRATIONAL_MINUTES in SOP_GRID_MINUTES
     assert LABEL_INTERICTAL != LABEL_PREICTAL
 
+    # --- symmetric exclusion buffer (v2) ---
+    assert SEIZURE_EXCLUSION_SECONDS == 4 * 3600
+    assert POSTICTAL_SECONDS == SEIZURE_EXCLUSION_SECONDS
+    assert INTERICTAL_GUARD_SECONDS == SEIZURE_EXCLUSION_SECONDS
+    assert INTERICTAL_POOL_MULTIPLIER > 0
+
     # --- continuity ---
     assert INTER_FILE_GAP_TOLERANCE_SECONDS >= 0
     assert "chb24" in PATIENTS_WITHOUT_CLOCKS
 
+    # --- classifier (v2 Elastic-Net) ---
+    assert LR_PARAMS["penalty"] == "elasticnet"
+    assert LR_PARAMS["solver"] == "saga", "elasticnet requires the saga solver"
+    assert 0.0 <= LR_PARAMS["l1_ratio"] <= 1.0
+    assert all(0.0 <= r <= 1.0 for r in L1_RATIO_GRID)
+    assert PRIMARY_CLASSIFIER in BENCHMARK_CLASSIFIERS
+
+    # --- balancing (v2) ---
+    assert USE_RESAMPLING is True
+    assert UNDERSAMPLE_INTERICTAL_TO_PREICTAL_RATIO >= OVERSAMPLE_TARGET_RATIO
+    assert OVERSAMPLE_TARGET_RATIO == 1.0
+
     # --- evaluation ---
     assert PRIMARY_TARGET_FPR_PER_HOUR in TARGET_FPR_PER_HOUR
-    assert PRIMARY_CLASSIFIER in BENCHMARK_CLASSIFIERS
 
     # --- paths are Path objects and dirs can be created ---
     assert isinstance(PROJECT_ROOT, Path)
