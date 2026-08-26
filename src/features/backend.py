@@ -1,0 +1,390 @@
+"""
+backend.py
+==========
+Stage 4 / Req E: the Riemannian compute shim.
+
+Everything downstream of spd.py (alignment, references, distances) needs the
+same small set of SPD-manifold primitives -- symmetric matrix functions
+(sqrt / inv-sqrt / inv / log / exp / pow), the AIRM geodesic distance, and the
+Frechet (Karcher) mean. This module is the single place those live, so the rest
+of the pipeline never touches raw eigendecompositions.
+
+Device / precision
+------------------
+Controlled entirely by config (nothing hard-coded):
+* COMPUTE_BACKEND = "auto" resolves the best torch device in the order the user
+  asked for -- cuda -> mps -> cpu -- via the canonical line
+      torch.device('cuda' if cuda else 'mps' if mps else 'cpu')
+  It can also be forced to "cuda" / "mps" / "cpu" / "numpy".
+* COMPUTE_DTYPE = "float64": all manifold math runs in double precision.
+* EIGH_BATCH_SIZE chunks large batched eigh calls so GPU VRAM stays bounded.
+
+Important caveat (Apple Silicon): PyTorch's MPS backend does NOT support float64
+nor `linalg.eigh`. Because we deliberately chose float64 for the AIRM / Frechet
+math, an auto-resolved `mps` device is transparently downgraded to CPU for the
+linear-algebra core (CUDA keeps full float64 on-GPU). This trades a bit of Mac
+speed for the numerical correctness the manifold math requires.
+
+Graceful fallback
+-----------------
+torch is imported lazily. If it is missing (as in the offline sandbox) or the
+effective device is CPU, every primitive runs on a NumPy path that is numerically
+identical. The dependency-light self-test therefore runs anywhere; the GPU path
+is exercised on the user's machine once torch is installed.
+
+Public surface (all take/return NumPy float64 arrays, batched over leading dims)
+-------------------------------------------------------------------------------
+    resolve_device(), effective_device(), torch_available(), backend_info()
+    symmetrize(C)                         exact symmetry
+    spd_sqrt / spd_invsqrt / spd_inv / spd_log / spd_exp / spd_pow(C, p)
+    eigvalsh(C)                           ascending eigenvalues
+    airm_distance(P, Q)                   delta_R = || log(eig(P^-1 Q)) ||_2
+    frechet_mean(mats, *, axis=0, weights=None)   AIRM Karcher mean
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from src import config as cfg
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
+
+_EPS = 1e-12                     # eigenvalue floor: guards log/inverse of round-off zeros
+
+
+# ---------------------------------------------------------------------------
+# Lazy torch + device resolution
+# ---------------------------------------------------------------------------
+_TORCH = None
+_TORCH_CHECKED = False
+
+
+def _torch():
+    global _TORCH, _TORCH_CHECKED
+    if not _TORCH_CHECKED:
+        _TORCH_CHECKED = True
+        try:
+            import torch  # type: ignore
+            _TORCH = torch
+        except Exception:            # not installed / import failure -> NumPy path
+            _TORCH = None
+    return _TORCH
+
+
+def torch_available() -> bool:
+    return _torch() is not None
+
+
+_AUTO_DEVICE = None
+
+
+def _auto_device() -> str:
+    """Best available torch device: cuda -> mps -> cpu (the user's canonical line)."""
+    global _AUTO_DEVICE
+    if _AUTO_DEVICE is not None:
+        return _AUTO_DEVICE
+    torch = _torch()
+    if torch is None:
+        _AUTO_DEVICE = "cpu"
+    else:
+        mps = getattr(torch.backends, "mps", None)
+        if torch.cuda.is_available():
+            _AUTO_DEVICE = "cuda"
+        elif mps is not None and mps.is_available():
+            _AUTO_DEVICE = "mps"
+        else:
+            _AUTO_DEVICE = "cpu"
+    return _AUTO_DEVICE
+
+
+def resolve_device() -> str:
+    """The device implied by COMPUTE_BACKEND, before the float64/MPS downgrade."""
+    backend = cfg.COMPUTE_BACKEND
+    if backend == "numpy":
+        return "cpu"
+    if backend in ("cpu", "cuda", "mps"):
+        return backend
+    return _auto_device()
+
+
+def _double() -> bool:
+    return cfg.COMPUTE_DTYPE == "float64"
+
+
+def effective_device() -> str:
+    """Device actually used for linalg, after the MPS+float64 -> CPU downgrade."""
+    dev = resolve_device()
+    if dev == "mps" and _double():
+        return "cpu"                # MPS lacks float64 / eigh
+    return dev
+
+
+def _use_torch() -> bool:
+    """Use the torch engine only when it actually buys GPU acceleration."""
+    if not torch_available() or cfg.COMPUTE_BACKEND == "numpy":
+        return False
+    return effective_device() in ("cuda", "mps")
+
+
+def backend_info() -> dict:
+    return {
+        "torch_available": torch_available(),
+        "compute_backend": cfg.COMPUTE_BACKEND,
+        "resolve_device": resolve_device(),
+        "effective_device": effective_device(),
+        "dtype": cfg.COMPUTE_DTYPE,
+        "engine": "torch" if _use_torch() else "numpy",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _np(x) -> np.ndarray:
+    return np.asarray(x, dtype=np.float64 if _double() else np.float32)
+
+
+def symmetrize(C: np.ndarray) -> np.ndarray:
+    C = _np(C)
+    return 0.5 * (C + np.swapaxes(C, -1, -2))
+
+
+_CLIP_KINDS = {"sqrt", "invsqrt", "inv", "log", "pow"}
+
+
+def _apply_scalar_np(w, kind, p):
+    if kind in _CLIP_KINDS:
+        w = np.clip(w, _EPS, None)
+    if kind == "sqrt":
+        return np.sqrt(w)
+    if kind == "invsqrt":
+        return 1.0 / np.sqrt(w)
+    if kind == "inv":
+        return 1.0 / w
+    if kind == "log":
+        return np.log(w)
+    if kind == "exp":
+        return np.exp(w)
+    if kind == "pow":
+        return np.power(w, p)
+    raise ValueError(f"unknown matrix function {kind!r}")
+
+
+def _funm_np(C, kind, p=None):
+    Csym = symmetrize(C)
+    w, V = np.linalg.eigh(Csym)
+    fw = _apply_scalar_np(w, kind, p)
+    out = (V * fw[..., None, :]) @ np.swapaxes(V, -1, -2)
+    return 0.5 * (out + np.swapaxes(out, -1, -2))
+
+
+def _funm_torch(C, kind, p=None):
+    torch = _torch()
+    assert torch is not None
+    dev = effective_device()
+    dtype = torch.float64 if _double() else torch.float32
+    Ct = torch.as_tensor(np.asarray(C), dtype=dtype, device=dev)
+    Ct = 0.5 * (Ct + Ct.transpose(-1, -2))
+    lead = Ct.shape[:-2]
+    n = Ct.shape[-1]
+    flat = Ct.reshape(-1, n, n)
+    batch = int(cfg.EIGH_BATCH_SIZE)
+    outs = []
+    for i in range(0, flat.shape[0], batch):
+        chunk = flat[i:i + batch]
+        w, V = torch.linalg.eigh(chunk)
+        if kind in _CLIP_KINDS:
+            w = torch.clamp(w, min=_EPS)
+        if kind == "sqrt":
+            fw = torch.sqrt(w)
+        elif kind == "invsqrt":
+            fw = torch.rsqrt(w)
+        elif kind == "inv":
+            fw = 1.0 / w
+        elif kind == "log":
+            fw = torch.log(w)
+        elif kind == "exp":
+            fw = torch.exp(w)
+        elif kind == "pow":
+            assert p is not None, "p must be provided when kind='pow'"
+            fw = torch.pow(w, p)
+        else:
+            raise ValueError(f"unknown matrix function {kind!r}")
+        rec = (V * fw.unsqueeze(-2)) @ V.transpose(-1, -2)
+        outs.append(0.5 * (rec + rec.transpose(-1, -2)))
+    out = torch.cat(outs, dim=0).reshape(*lead, n, n)
+    return out.detach().to("cpu", dtype=torch.float64).numpy()
+
+
+def _funm(C, kind, p=None):
+    if _use_torch():
+        return _funm_torch(C, kind, p)
+    return _funm_np(C, kind, p)
+
+
+# ---------------------------------------------------------------------------
+# Public matrix functions
+# ---------------------------------------------------------------------------
+def spd_sqrt(C):    return _funm(C, "sqrt")
+def spd_invsqrt(C): return _funm(C, "invsqrt")
+def spd_inv(C):     return _funm(C, "inv")
+def spd_log(C):     return _funm(C, "log")
+def spd_exp(S):     return _funm(S, "exp")
+def spd_pow(C, p):  return _funm(C, "pow", p)
+
+
+def eigvalsh(C) -> np.ndarray:
+    """Ascending eigenvalues of symmetric matrices, batched: (..., n) ."""
+    if _use_torch():
+        torch = _torch()
+        assert torch is not None
+        dev = effective_device()
+        dtype = torch.float64 if _double() else torch.float32
+        Ct = torch.as_tensor(np.asarray(C), dtype=dtype, device=dev)
+        Ct = 0.5 * (Ct + Ct.transpose(-1, -2))
+        lead = Ct.shape[:-2]
+        n = Ct.shape[-1]
+        flat = Ct.reshape(-1, n, n)
+        batch = int(cfg.EIGH_BATCH_SIZE)
+        outs = [torch.linalg.eigvalsh(flat[i:i + batch])
+                for i in range(0, flat.shape[0], batch)]
+        w = torch.cat(outs, dim=0).reshape(*lead, n)
+        return w.detach().to("cpu", dtype=torch.float64).numpy()
+    return np.linalg.eigvalsh(symmetrize(C))
+
+
+def airm_distance(P, Q) -> np.ndarray:
+    """AIRM geodesic distance delta_R(P, Q) = || log(eig(P^-1 Q)) ||_2, batched.
+
+    Computed from the SPD-similarity form M = P^-1/2 Q P^-1/2 (eigenvalues equal
+    the generalized eigenvalues of (Q, P)), which is symmetric and numerically
+    stable. P and Q broadcast over leading dims.
+    """
+    P_ih = spd_invsqrt(P)
+    M = P_ih @ _np(Q) @ P_ih
+    w = eigvalsh(M)
+    logw = np.log(np.clip(w, _EPS, None))
+    return np.sqrt(np.sum(logw * logw, axis=-1))
+
+
+# ---------------------------------------------------------------------------
+# Frechet (Karcher) mean under AIRM
+# ---------------------------------------------------------------------------
+def frechet_mean(mats, *, axis: int = 0, weights=None, max_iter: int | None = None , tol: float | None = None) -> np.ndarray:
+    """Weighted AIRM Frechet (Karcher) mean of SPD matrices along `axis`.
+
+    mats : (..., K, ..., n, n) SPD matrices; the mean is taken over `axis`, which
+           is treated as the sample axis. All other leading dims (e.g. channel x
+           span) are batched independently. Returns shape with `axis` removed.
+    weights : optional length-K non-negative weights (normalized internally);
+              None -> equal weights. Used for the two-level (equal-per-patient)
+              population anchors in references.py.
+    """
+    max_iter = cfg.RIEMANN_MEAN_MAX_ITER if max_iter is None else max_iter
+    tol = cfg.RIEMANN_MEAN_TOL if tol is None else tol
+
+    X = np.moveaxis(_np(mats), axis, 0)          # (K, ..., n, n)
+    K = X.shape[0]
+    if K == 0:
+        raise ValueError("frechet_mean requires at least one matrix")
+
+    if weights is None:
+        w = np.full(K, 1.0 / K, dtype=np.float64)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.shape != (K,):
+            raise ValueError(f"weights must have shape ({K},), got {w.shape}")
+        if np.any(w < 0):
+            raise ValueError("weights must be non-negative")
+        s = w.sum()
+        if s <= 0:
+            raise ValueError("weights must sum to a positive value")
+        w = w / s
+    w_b = w.reshape((K,) + (1,) * (X.ndim - 1))   # broadcast over trailing dims
+
+    if K == 1:
+        return symmetrize(X[0])
+
+    # Initialize at the (SPD) weighted arithmetic mean.
+    M = symmetrize(np.sum(w_b * X, axis=0))
+    for _ in range(int(max_iter)):
+        M_half = spd_sqrt(M)
+        M_ih = spd_invsqrt(M)
+        proj = M_ih[None] @ X @ M_ih[None]        # whiten each sample: (K, ..., n, n)
+        tang = spd_log(proj)                       # tangent vectors at I
+        Tbar = np.sum(w_b * tang, axis=0)          # weighted mean tangent
+        M = symmetrize(M_half @ spd_exp(Tbar) @ M_half)
+        step = np.sqrt(np.sum(Tbar * Tbar, axis=(-1, -2)))
+        if float(np.max(step)) < tol:
+            break
+    return M
+
+
+# ---------------------------------------------------------------------------
+# Self-test (NumPy path; no torch / scipy / pyriemann required)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("Running backend.py self-test ...\n")
+    print("backend_info:", backend_info())
+    rng = np.random.default_rng(cfg.SEED)
+    n = 6
+
+    def rand_spd(lead=()):
+        A = rng.standard_normal(lead + (n, n))
+        return A @ np.swapaxes(A, -1, -2) + n * np.eye(n)
+
+    eye = np.eye(n)
+    C = rand_spd((4,))                      # batched SPD
+
+    # --- matrix functions ---
+    S = spd_sqrt(C)
+    assert np.allclose(S @ S, C, atol=1e-8)
+    Ih = spd_invsqrt(C)
+    assert np.allclose(Ih @ C @ Ih, eye, atol=1e-8)
+    assert np.allclose(spd_inv(C) @ C, eye, atol=1e-8)
+    assert np.allclose(spd_exp(spd_log(C)), C, atol=1e-8)
+    assert np.allclose(spd_pow(C, 0.5), spd_sqrt(C), atol=1e-8)
+    assert np.allclose(spd_pow(C, -0.5), spd_invsqrt(C), atol=1e-8)
+
+    # --- AIRM distance: zero, symmetry, affine invariance, reference ---
+    P, Q = rand_spd(), rand_spd()
+    assert abs(float(airm_distance(P, P))) < 1e-9
+    assert np.allclose(airm_distance(P, Q), airm_distance(Q, P), atol=1e-9)
+
+    W = rng.standard_normal((n, n))
+    while abs(np.linalg.det(W)) < 1e-2:
+        W = rng.standard_normal((n, n))
+    d_plain = airm_distance(P, Q)
+    d_congr = airm_distance(W @ P @ W.T, W @ Q @ W.T)
+    assert np.allclose(d_plain, d_congr, atol=1e-7), "AIRM must be affine-invariant"
+
+    ref_eigs = np.linalg.eigvals(np.linalg.solve(P, Q)).real
+    d_ref = np.sqrt(np.sum(np.log(np.clip(ref_eigs, _EPS, None)) ** 2))
+    assert np.allclose(d_plain, d_ref, atol=1e-6)
+
+    # --- Frechet mean ---
+    C1 = rand_spd()
+    assert np.allclose(frechet_mean(np.stack([C1] * 5)), C1, atol=1e-8)
+
+    K = 7
+    d = rng.uniform(0.5, 3.0, size=(K, n))
+    Xd = np.stack([np.diag(d[k]) for k in range(K)])
+    fm = frechet_mean(Xd, axis=0)
+    expected = np.diag(np.exp(np.mean(np.log(d), axis=0)))   # geometric mean on the diagonal
+    assert np.allclose(fm, expected, atol=1e-7)
+
+    # batched (channel x span) Frechet mean stays SPD
+    Xb = rand_spd((K, 3, 2))                # (K, nc, sr, n, n)
+    Mb = frechet_mean(Xb, axis=0)
+    assert Mb.shape == (3, 2, n, n)
+    assert np.linalg.eigvalsh(Mb).min() > 0.0
+
+    # weighted mean with equal weights == unweighted
+    assert np.allclose(frechet_mean(Xd, weights=np.ones(K)), fm, atol=1e-9)
+
+    # determinism
+    assert np.array_equal(spd_log(C), spd_log(C))
+
+    print("OK - backend.py self-test passed.")

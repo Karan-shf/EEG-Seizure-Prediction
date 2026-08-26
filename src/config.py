@@ -362,7 +362,64 @@ THRESHOLD_SELECTION: str = "train_val_fixed_fpr"
 
 
 # ---------------------------------------------------------------------------
-# 9. Convenience summary
+# 9. Active experiment axes  [what the headline LOPO sweep actually varies]
+# ---------------------------------------------------------------------------
+# The headline experiment sweeps ONLY:  alpha  x  span-roof  x  LOPO patient.
+# Every other axis is HELD at its single default value (window = 6 s, SOP =
+# 30 min). Nothing downstream is hard-coded: experiment drivers iterate these
+# SWEEP_* tuples, while the feature / label code reads the scalar defaults
+# WINDOW_SECONDS and SOP_PRIMARY_MINUTES. To sweep a frozen axis later, point
+# it at the matching *_GRID here -- no other file changes are required.
+SWEEP_ALPHA: tuple[float, ...] = ALPHA_GRID           # (0, 0.25, 0.5, 0.75, 1.0)
+SWEEP_SPAN_ROOF: tuple[int, ...] = SPAN_ROOF_GRID     # (1, 3, 5, 7, 9)
+SWEEP_WINDOW_SECONDS: tuple[float, ...] = (WINDOW_SECONDS,)   # frozen -> WINDOW_SECONDS_GRID to sweep
+SWEEP_SOP_MINUTES: tuple[int, ...] = (SOP_PRIMARY_MINUTES,)   # frozen -> SOP_GRID_MINUTES to sweep
+
+
+# ---------------------------------------------------------------------------
+# 10. Compute backend + LOPO caching  [GPU auto-select; fold-invariant reuse]
+# ---------------------------------------------------------------------------
+# Heavy linear algebra -- batched 180x180 eigendecompositions for AIRM geodesic
+# distances and Frechet/Karcher means, plus SPD construction -- runs on the best
+# available device. config stays import-light and NEVER imports torch; the
+# backend module (src/features/backend.py) resolves the device lazily:
+#
+#     device = torch.device(
+#         "cuda" if torch.cuda.is_available() else
+#         "mps"  if torch.backends.mps.is_available() else
+#         "cpu"
+#     )
+#
+COMPUTE_BACKEND: str = "auto"     # "auto" -> cuda|mps|cpu ; or force "cpu"/"cuda"/"mps"/"numpy"
+COMPUTE_DTYPE: str = "float64"    # manifold-math precision (AIRM / Frechet means): float64 everywhere
+EIGH_BATCH_SIZE: int = 4096       # matrices per batched eigh call on GPU (tune to available VRAM)
+
+# Population anchors are TWO-LEVEL: cache each patient's own recentered
+# interictal/preictal Frechet mean once (fold-invariant), then each LOPO fold's
+# anchor = Frechet mean of the SOURCE patients' cached per-patient means (equal
+# patient weight; NO re-pooling of raw windows across folds).
+ANCHOR_ESTIMATOR: str = "two_level"   # "two_level" (per-patient means) | "pooled" (all source windows)
+
+# Dense recentered SPD matrices are NEVER persisted (hundreds of GB/patient);
+# they are streamed and recomputed per fold on the device. Only small, truly
+# fold-invariant artifacts are cached to disk and reused across all 24 folds.
+CACHE_ENABLED: bool = True
+CACHE_DENSE_SPD: bool = False         # keep False; True would persist 100s of GB
+CACHE_DIR: Path = PROCESSED_DIR / "lopo_cache"   # created lazily by the cache module
+
+# Cached once per patient, reused every LOPO fold (all fold-invariant):
+#   clean_signal          - montaged / filtered signal per file
+#   window_plan           - window offsets + labels + interictal pool
+#   g_patient             - own-interictal recentering anchor per (channel x span x alpha)
+#   d_baseline            - deltaR(C', I) per window (a full 1/3 of the 486-D features)
+#   patient_anchor_means  - that patient's own interictal & preictal recentered Frechet means
+CACHE_FOLD_INVARIANT: tuple[str, ...] = (
+    "clean_signal", "window_plan", "g_patient", "d_baseline", "patient_anchor_means",
+)
+
+
+# ---------------------------------------------------------------------------
+# 11. Convenience summary
 # ---------------------------------------------------------------------------
 def summary() -> str:
     """Return a human-readable dump of the most important derived settings."""
@@ -395,6 +452,9 @@ def summary() -> str:
         f"Classifier               : {PRIMARY_CLASSIFIER} "
         f"({LR_PARAMS['penalty']}, solver={LR_PARAMS['solver']})",
         f"CV scheme                : {CV_SCHEME}",
+        f"Headline sweep           : alpha{SWEEP_ALPHA} x span{SWEEP_SPAN_ROOF} x LOPO",
+        f"Frozen axes              : window={SWEEP_WINDOW_SECONDS[0]}s, SOP={SWEEP_SOP_MINUTES[0]}min",
+        f"Compute backend          : {COMPUTE_BACKEND} ({COMPUTE_DTYPE}); anchors={ANCHOR_ESTIMATOR}",
     ])
 
 
