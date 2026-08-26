@@ -3,7 +3,7 @@
 # Install with:  pip install -r requirements.txt
 
 # --- Core numerical / scientific computing ---
-numpy>=1.24
+numpy>=1.24,<2.0
 scipy>=1.11
 pandas>=2.0,<3.0
 
@@ -29,3 +29,6 @@ ipykernel>=6.25,<7.0
 
 # --- Progress bars / logging ---
 tqdm>=4.66,<5.0
+
+# ---Deep Learning and GPU Computing ---
+torch>=2.2,<3.0
