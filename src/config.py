@@ -400,6 +400,19 @@ EIGH_BATCH_SIZE: int = 4096       # matrices per batched eigh call on GPU (tune 
 # patient weight; NO re-pooling of raw windows across folds).
 ANCHOR_ESTIMATOR: str = "two_level"   # "two_level" (per-patient means) | "pooled" (all source windows)
 
+# Feature-anchor assembly mode for the LOPO drivers (src/data/dataset_builder.py):
+#   "exact" - per-fold leave-one-out level-2 anchors for EVERY patient. Every
+#             patient is re-streamed each fold (24 folds x N windows of SPD work).
+#   "fast"  - Tier-1 "purist" variant: TRAIN features use a GLOBAL anchor (all
+#             patients) computed & cached ONCE per (cohort, alpha); the HELD-OUT
+#             patient uses the exact source-only leave-one-out anchor
+#             (leakage-free). Only the held-out patient is re-streamed per fold
+#             -> ~an order of magnitude less streaming, ~1-2 GB feature cache per
+#             alpha. Validate parity first with
+#             `python3 -m src.run lopo ... --validate-anchors`.
+#             See docs/27_fast_anchor_mode.md.
+FEATURE_ANCHOR_MODE: str = "exact"
+
 # Dense recentered SPD matrices are NEVER persisted (hundreds of GB/patient);
 # they are streamed and recomputed per fold on the device. Only small, truly
 # fold-invariant artifacts are cached to disk and reused across all 24 folds.
@@ -413,8 +426,13 @@ CACHE_DIR: Path = PROCESSED_DIR / "lopo_cache"   # created lazily by the cache m
 #   g_patient             - own-interictal recentering anchor per (channel x span x alpha)
 #   d_baseline            - deltaR(C', I) per window (a full 1/3 of the 486-D features)
 #   patient_anchor_means  - that patient's own interictal & preictal recentered Frechet means
+#   global_anchor         - fast mode: level-2 anchor over ALL patients (per cohort x alpha)
+#   global_features       - fast mode: per-window distances vs the global anchor (TRAIN)
+#   loo_features          - fast mode: per-window distances vs the held-out patient's
+#                           source-only leave-one-out anchor (leakage-free TEST features)
 CACHE_FOLD_INVARIANT: tuple[str, ...] = (
     "clean_signal", "window_plan", "g_patient", "d_baseline", "patient_anchor_means",
+    "global_anchor", "global_features", "loo_features",
 )
 
 

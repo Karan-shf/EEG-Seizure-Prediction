@@ -209,16 +209,18 @@ class FoldData:
         return self.X_train.shape[1]
 
 
-def _patient_features(provider, pid, references, span_roof, *, fingerprint):
-    """Stream one patient's windows -> (X (n_windows, feature_dim), y).
+def _patient_distance_tensor(provider, pid, references, *, fingerprint):
+    """Stream one patient's windows ONCE -> (D, labels).
 
-    Baseline column is read from the cached fold-invariant d_baseline; the two
-    population columns are recomputed here (per fold) by streaming + recentering.
-    Dense SPD is discarded per window.
+    D : (n_windows, n_channels, span, n_references) AIRM distances to `references`
+        (in references.names order), computed at the reference's full span roof
+        so any downstream span roof m is a cheap slice. The baseline column is
+        read from the cached fold-invariant d_baseline; the two population
+        columns are computed here against `references`. Dense SPD is discarded
+        per window.
     """
     g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fingerprint))
     base = patient_baseline_distances(provider, pid, fingerprint=fingerprint)
-    m = span_roof
     names = references.names
     m_int = references.get("interictal")
     m_pre = references.get("preictal")
@@ -230,24 +232,117 @@ def _patient_features(provider, pid, references, span_roof, *, fingerprint):
         cols = []
         for name in names:
             if name == "baseline":
-                cols.append(base.d_baseline[idx])                 # cached (nc, sr)
+                cols.append(base.d_baseline[idx])                 # cached (nc, span)
             elif name == "interictal":
-                cols.append(dist.population_distances(cp, m_int))  # (nc, sr)
+                cols.append(dist.population_distances(cp, m_int))  # (nc, span)
             elif name == "preictal":
-                cols.append(dist.population_distances(cp, m_pre))  # (nc, sr)
+                cols.append(dist.population_distances(cp, m_pre))  # (nc, span)
             else:
                 raise ValueError(f"unknown reference name {name!r}")
-        D = np.stack(cols, axis=-1)[:, :m, :]                     # (nc, m, n_refs)
-        rows.append(D.reshape(-1))
+        rows.append(np.stack(cols, axis=-1))                      # (nc, span, n_refs)
         idx += 1
 
-    X = np.asarray(rows, dtype=float) if rows else np.empty((0, 0))
-    return X, base.labels.copy()
+    if rows:
+        D = np.stack(rows)                                        # (nw, nc, span, n_refs)
+    else:
+        nc = len(references.channels)
+        D = np.zeros((0, nc, references.span_roof, len(names)), dtype=float)
+    return D, base.labels.copy()
+
+
+def _slice_features(D: np.ndarray, span_roof: int) -> np.ndarray:
+    """Slice a (nw, nc, span, n_refs) distance tensor to span roof m and flatten
+    to (nw, feature_dim(m)) in canonical channel-major / span / reference order."""
+    D = np.asarray(D, dtype=float)
+    nw, nc, _sr, n_refs = D.shape
+    return D[:, :, :span_roof, :].reshape(nw, nc * span_roof * n_refs)
+
+
+def _patient_features(provider, pid, references, span_roof, *, fingerprint):
+    """Stream one patient's windows -> (X (n_windows, feature_dim(m)), y).
+
+    Thin wrapper over `_patient_distance_tensor` + `_slice_features`; the EXACT
+    (per-fold anchor) path. Numerically identical to the pre-refactor version.
+    """
+    D, y = _patient_distance_tensor(provider, pid, references, fingerprint=fingerprint)
+    return _slice_features(D, span_roof), y
+
+
+# ---------------------------------------------------------------------------
+# Fast (Tier-1 "purist") feature caching
+# ---------------------------------------------------------------------------
+# TRAIN features are computed against a GLOBAL anchor (Frechet mean over ALL
+# patients' level-1 means) that does not depend on which patient is held out, so
+# each patient is streamed & cached exactly once. The HELD-OUT patient's
+# features use the exact source-only leave-one-out anchor (identical to exact
+# mode), so nothing about the held-out patient leaks into its own features. Only
+# the held-out patient is re-streamed per fold. See docs/27_fast_anchor_mode.md.
+def _cohort_hash(patient_ids) -> str:
+    """Stable 8-hex digest of a patient set (order-independent). Part of the
+    fast-mode cache key so a DIFFERENT cohort never reuses another cohort's
+    global anchor / features."""
+    key = ",".join(sorted(str(p) for p in patient_ids))
+    return hashlib.sha1(key.encode()).hexdigest()[:8]
+
+
+def _fast_tag(patient_ids, alpha: float) -> str:
+    """Cache-key tag binding BOTH alpha and the cohort composition."""
+    return f"a{float(alpha):.4f}_c{_cohort_hash(patient_ids)}"
+
+
+def global_references(provider, patient_ids, *, fingerprint, tag):
+    """Level-2 population anchors over ALL `patient_ids` (the fold-INVARIANT
+    GLOBAL reference set used for TRAIN features in fast mode). Cached per
+    (cohort, alpha) via `tag`."""
+    ids = list(patient_ids)
+
+    def compute():
+        pms = [patient_anchor_means(provider, p, fingerprint=fingerprint) for p in ids]
+        return refs.build_fold_references(
+            pms, channels=tuple(provider.channels()), source_patient_ids=ids)
+
+    return cache.get_or_compute("global_anchor", f"anchor_{tag}", compute,
+                                fingerprint=fingerprint)
+
+
+def patient_global_features(provider, pid, *, references, fingerprint, tag):
+    """Per-window distance tensor for `pid` vs the GLOBAL anchor, cached per
+    (patient, cohort, alpha). Streams `pid` at most once, ever."""
+    def compute():
+        D, y = _patient_distance_tensor(provider, pid, references, fingerprint=fingerprint)
+        return {"D": D, "y": y}
+
+    return cache.get_or_compute("global_features", f"{pid}_{tag}", compute,
+                                fingerprint=fingerprint)
+
+
+def patient_loo_features(provider, test_patient, *, references, fingerprint, tag):
+    """Per-window distance tensor for the HELD-OUT patient vs its source-only
+    leave-one-out anchor -> leakage-free TEST features. Cached per
+    (patient, cohort, alpha); recomputed once per fold on a cold cache."""
+    def compute():
+        D, y = _patient_distance_tensor(provider, test_patient, references,
+                                        fingerprint=fingerprint)
+        return {"D": D, "y": y}
+
+    return cache.get_or_compute("loo_features", f"{test_patient}_{tag}", compute,
+                                fingerprint=fingerprint)
 
 
 def build_fold(provider: SpdWindowProvider, test_patient: str, *,
-               span_roof: int | None = None, fingerprint: str | None = None) -> FoldData:
-    """Build one LOPO fold: held-out = test_patient, source = all others."""
+               span_roof: int | None = None, fingerprint: str | None = None,
+               fast: bool = False, alpha: float | None = None) -> FoldData:
+    """Build one LOPO fold: held-out = test_patient, source = all others.
+
+    fast=False (default, "exact"): per-fold leave-one-out level-2 anchors for
+        EVERY patient (train + test) -- the original behavior; every patient is
+        re-streamed each fold.
+    fast=True ("purist", needs `alpha`): TRAIN features use a GLOBAL anchor over
+        ALL patients, computed & cached ONCE per (cohort, alpha); the HELD-OUT
+        patient's features use the exact source-only leave-one-out anchor
+        (leakage-free, bit-identical to exact mode). Only the held-out patient
+        is re-streamed per fold. See docs/27_fast_anchor_mode.md.
+    """
     fp = fingerprint or _fingerprint()
     ids = list(provider.patient_ids())
     if test_patient not in ids:
@@ -256,21 +351,45 @@ def build_fold(provider: SpdWindowProvider, test_patient: str, *,
     source = [p for p in ids if p != test_patient]
     if not source:
         raise ValueError("need >= 2 patients for a LOPO fold")
-
-    # Level-1 means for source patients (cached), then per-fold level-2 anchors.
-    pms = [patient_anchor_means(provider, p, fingerprint=fp) for p in source]
-    references = refs.build_fold_references(
-        pms, channels=tuple(provider.channels()), source_patient_ids=source)
-
-    Xtr, ytr, gtr = [], [], []
-    for p in source:
-        X, y = _patient_features(provider, p, references, span_roof, fingerprint=fp)
-        Xtr.append(X)
-        ytr.append(y)
-        gtr.append(np.full(len(y), p, dtype=object))
-    Xte, yte = _patient_features(provider, test_patient, references, span_roof, fingerprint=fp)
-
     channels = tuple(provider.channels())
+
+    if fast:
+        if alpha is None:
+            raise ValueError("fast mode needs `alpha` for the feature-cache key")
+        tag = _fast_tag(ids, alpha)
+
+        # TRAIN: cached features vs the GLOBAL anchor (built over ALL patients).
+        R_global = global_references(provider, ids, fingerprint=fp, tag=tag)
+        Xtr, ytr, gtr = [], [], []
+        for p in source:
+            gf = patient_global_features(provider, p, references=R_global,
+                                         fingerprint=fp, tag=tag)
+            Xtr.append(_slice_features(gf["D"], span_roof))
+            ytr.append(gf["y"])
+            gtr.append(np.full(len(gf["y"]), p, dtype=object))
+
+        # TEST: exact source-only leave-one-out anchor -> no test-side leakage.
+        src_means = [patient_anchor_means(provider, p, fingerprint=fp) for p in source]
+        R_loo = refs.build_fold_references(
+            src_means, channels=channels, source_patient_ids=source)
+        lf = patient_loo_features(provider, test_patient, references=R_loo,
+                                  fingerprint=fp, tag=tag)
+        Xte = _slice_features(lf["D"], span_roof)
+        yte = lf["y"]
+    else:
+        # Level-1 means for source patients (cached), then per-fold level-2 anchors.
+        pms = [patient_anchor_means(provider, p, fingerprint=fp) for p in source]
+        references = refs.build_fold_references(
+            pms, channels=channels, source_patient_ids=source)
+
+        Xtr, ytr, gtr = [], [], []
+        for p in source:
+            X, y = _patient_features(provider, p, references, span_roof, fingerprint=fp)
+            Xtr.append(X)
+            ytr.append(y)
+            gtr.append(np.full(len(y), p, dtype=object))
+        Xte, yte = _patient_features(provider, test_patient, references, span_roof, fingerprint=fp)
+
     fnames = dist.feature_names(channels, span_roof)
     width = cfg.N_REFERENCES * span_roof * len(channels)
     if len(channels) == cfg.N_CHANNELS and width != cfg.feature_dim(span_roof):
@@ -382,6 +501,29 @@ if __name__ == "__main__":
     folds = build_lopo(provider, span_roof=1)
     assert len(folds) == len(provider.patient_ids())
     assert {f.test_patient for f in folds} == set(provider.patient_ids())
+
+    # --- fast (Tier-1 "purist") mode ---
+    # Held-out TEST features must be IDENTICAL to exact mode (same source-only
+    # leave-one-out anchor); TRAIN features differ (global vs per-fold anchor).
+    fold_exact = build_fold(provider, "A", span_roof=sr, fast=False)
+    fold_fast = build_fold(provider, "A", span_roof=sr, fast=True, alpha=0.5)
+    assert fold_fast.X_test.shape == fold_exact.X_test.shape
+    assert np.allclose(fold_fast.X_test, fold_exact.X_test, atol=1e-9), \
+        "fast-mode held-out features must match the exact leave-one-out anchor"
+    assert fold_fast.X_train.shape == fold_exact.X_train.shape
+    assert np.array_equal(fold_fast.y_test, fold_exact.y_test)
+    assert np.all(np.isfinite(fold_fast.X_train)) and np.all(np.isfinite(fold_fast.X_test))
+    tag05 = _fast_tag(provider.patient_ids(), 0.5)
+    assert cache.has("global_anchor", f"anchor_{tag05}", fingerprint=fp)
+    assert cache.has("global_features", f"B_{tag05}", fingerprint=fp)
+    assert cache.has("loo_features", f"A_{tag05}", fingerprint=fp)
+    # alpha is part of the cache key -> no cross-alpha collision
+    assert _fast_tag(provider.patient_ids(), 0.5) != _fast_tag(provider.patient_ids(), 1.0)
+    build_fold(provider, "A", span_roof=sr, fast=True, alpha=1.0)
+    assert cache.has("global_features", f"B_{_fast_tag(provider.patient_ids(), 1.0)}", fingerprint=fp)
+    # fast train narrows with span roof just like exact
+    fold_fast_m1 = build_fold(provider, "A", span_roof=1, fast=True, alpha=0.5)
+    assert fold_fast_m1.X_train.shape[1] == nc * 1 * n_refs
 
     import shutil
     shutil.rmtree(cfg.CACHE_DIR, ignore_errors=True)

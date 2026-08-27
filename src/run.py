@@ -162,12 +162,49 @@ def _print_lopo(res) -> None:
 
 def _run_lopo(args: argparse.Namespace) -> int:
     patients = _resolve_eligible(args) if args.eligible_only else _expand_patients(args.patients)
+    if getattr(args, "validate_anchors", False):
+        return _validate_anchors(args, patients)
     res = lopo_mod.run_lopo(
         alpha=args.alpha, span_roof=args.span_roof, patients=patients,
         raw_dir=args.raw_dir, sop_minutes=args.sop,
         classifier_name=args.classifier, target_fpr_per_hour=args.target_fpr,
-        seed=args.seed)
+        seed=args.seed, mode=args.mode)
     _print_lopo(res)
+    return 0
+
+
+def _validate_anchors(args: argparse.Namespace, patients) -> int:
+    """Run the SAME LOPO both ways (exact vs fast/purist) and print a
+    side-by-side metric comparison, so the anchor approximation can be trusted
+    before committing to the full grid."""
+    common = dict(
+        alpha=args.alpha, span_roof=args.span_roof, patients=patients,
+        raw_dir=args.raw_dir, sop_minutes=args.sop,
+        classifier_name=args.classifier, target_fpr_per_hour=args.target_fpr,
+        seed=args.seed)
+    log.info("validate-anchors: running EXACT mode ...")
+    exact = lopo_mod.run_lopo(mode="exact", **common)
+    log.info("validate-anchors: running FAST (purist) mode ...")
+    fast = lopo_mod.run_lopo(mode="fast", **common)
+
+    metrics = ("pooled_auc", "mean_patient_auc", "mean_event_sensitivity",
+               "pooled_event_sensitivity", "pooled_fpr_per_hour", "mean_warning_seconds")
+
+    def _fmt(x):
+        return f"{x:.4f}" if isinstance(x, (int, float)) and x == x else "nan"
+
+    hdr = f"{'metric':<26} {'exact':>10} {'fast':>10} {'delta':>10}"
+    print(f"\nAnchor-mode validation  alpha={args.alpha}  span_roof={args.span_roof}")
+    print(hdr)
+    print("-" * len(hdr))
+    for k in metrics:
+        ve, vf = exact.summary.get(k), fast.summary.get(k)
+        both_num = all(isinstance(v, (int, float)) and v == v for v in (ve, vf))
+        dv = (vf - ve) if both_num else float("nan") # type: ignore
+        print(f"{k:<26} {_fmt(ve):>10} {_fmt(vf):>10} {_fmt(dv):>10}")
+    print("-" * len(hdr))
+    print("Small deltas (esp. pooled_auc / event sensitivity) => the purist "
+          "speedup is safe to adopt for the grid.")
     return 0
 
 
@@ -188,7 +225,7 @@ def _run_grid(args: argparse.Namespace) -> int:
         alphas=args.alphas, span_roofs=args.span_roofs, patients=patients,
         raw_dir=args.raw_dir, sop_minutes=args.sop,
         classifier_name=args.classifier, target_fpr_per_hour=args.target_fpr,
-        seed=args.seed, save=not args.no_save,
+        seed=args.seed, mode=args.mode, save=not args.no_save,
         results_dir=args.results_dir, tag=args.tag)
     _print_grid(grid)
     if not args.no_save:
@@ -218,6 +255,9 @@ def _add_common(sp: argparse.ArgumentParser, *, with_eligible: bool) -> None:
                     help=f"target FPR/h (default: {cfg.PRIMARY_TARGET_FPR_PER_HOUR})")
     sp.add_argument("--seed", type=int, default=None,
                     help=f"random seed (default: {cfg.SEED})")
+    sp.add_argument("--mode", choices=("exact", "fast"), default=cfg.FEATURE_ANCHOR_MODE,
+                    help="feature-anchor mode: 'fast' = Tier-1 purist cached global "
+                         f"anchor (~10x less streaming); default: {cfg.FEATURE_ANCHOR_MODE}")
     if with_eligible:
         sp.add_argument("--eligible-only", action="store_true",
                         help="run inventory first and keep only eligible patients")
@@ -248,6 +288,9 @@ def _build_parser() -> argparse.ArgumentParser:
     lo = sub.add_parser("lopo", help="single (alpha, span_roof) LOPO run")
     lo.add_argument("--alpha", type=float, required=True)
     lo.add_argument("--span-roof", type=int, default=None, dest="span_roof")
+    lo.add_argument("--validate-anchors", action="store_true", dest="validate_anchors",
+                    help="run BOTH exact and fast modes and print a side-by-side "
+                         "comparison (trust the purist speedup before the full grid)")
     _add_common(lo, with_eligible=True)
 
     gr = sub.add_parser("grid", help="alpha x span-roof x LOPO sweep")

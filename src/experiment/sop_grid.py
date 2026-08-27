@@ -116,6 +116,7 @@ def run_grid(*, alphas: Optional[Sequence[float]] = None,
              target_fpr_per_hour: Optional[float] = None,
              provider_factory: Optional[Callable[[float], object]] = None,
              seed: Optional[int] = None,
+             mode: str = "exact",
              save: bool = True,
              results_dir: Optional[Path] = None,
              tag: Optional[str] = None) -> GridResult:
@@ -138,7 +139,7 @@ def run_grid(*, alphas: Optional[Sequence[float]] = None,
         for m in span_roofs:
             res = run_lopo(alpha=a, span_roof=m, provider=provider, patients=patients,
                            raw_dir=raw_dir, sop_minutes=sop, classifier_name=cname,
-                           target_fpr_per_hour=target, seed=seed)
+                           target_fpr_per_hour=target, seed=seed, mode=mode)
             cells.append(res)
             log.info("grid cell alpha=%.2f m=%d: pooled_auc=%.3f event_sens=%.3f fpr/h=%.3f",
                      a, m, res.summary["pooled_auc"],
