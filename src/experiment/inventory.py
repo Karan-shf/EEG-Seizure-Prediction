@@ -273,17 +273,24 @@ if __name__ == "__main__":
                        n_seizures=len(seizures),
                        seizures=[Seizure(s, e) for s, e in seizures])
 
-    # --- clock patient: 3 stitched 1 h files, one lead seizure well inside ---
+    # --- clock patient: 8 stitched 1 h files, one lead seizure near the END so
+    #     the early hours survive the +/-4 h seizure-exclusion as interictal ---
+    #     (a short recording gets fully swallowed by the exclusion -> 0 interictal)
     files = [
         mk("c1", "12:00:00", "13:00:00"),
-        mk("c2", "13:00:04", "14:00:04", seizures=[(1800.0, 1860.0)]),  # lead
+        mk("c2", "13:00:04", "14:00:04"),
         mk("c3", "14:00:08", "15:00:08"),
+        mk("c4", "15:00:12", "16:00:12"),
+        mk("c5", "16:00:16", "17:00:16"),
+        mk("c6", "17:00:20", "18:00:20"),
+        mk("c7", "18:00:24", "19:00:24"),
+        mk("c8", "19:00:28", "20:00:28", seizures=[(1800.0, 1860.0)]),  # lead, late
     ]
     summary = PatientSummary("chb99", cfg.FS, ["FP1-F7"], files)
     inv = inventory_from_summary(summary, sop_minutes=30)
     print(inv.to_dict(), "\n")
     assert inv.has_clocks and inv.sized
-    assert inv.n_files == 3 and inv.n_segments == 1 and inv.n_hard_breaks == 0
+    assert inv.n_files == 8 and inv.n_segments == 1 and inv.n_hard_breaks == 0
     assert inv.total_seizures == 1 and inv.n_lead_seizures == 1
     assert inv.n_preictal_windows > 0 and inv.n_interictal_kept > 0
     assert inv.eligible and inv.reason == "ok"
@@ -302,9 +309,11 @@ if __name__ == "__main__":
                          [mk("n1", None, None, seizures=[(1800.0, 1860.0)])])
     inv_nc = inventory_from_summary(ncs)
     assert not inv_nc.has_clocks and not inv_nc.sized and not inv_nc.eligible
-    # ...but pass explicit sample counts and it sizes + becomes eligible
-    inv_nc2 = inventory_from_summary(ncs, file_samples={"n1": 3600 * cfg.FS})
-    assert inv_nc2.sized and inv_nc2.n_preictal_windows > 0 and inv_nc2.eligible
+    # ...but pass explicit sample counts (8 h so interictal survives the +/-4 h
+    # exclusion around the early seizure) and it sizes + becomes eligible
+    inv_nc2 = inventory_from_summary(ncs, file_samples={"n1": 8 * 3600 * cfg.FS})
+    assert inv_nc2.sized and inv_nc2.n_preictal_windows > 0
+    assert inv_nc2.n_interictal_kept > 0 and inv_nc2.eligible
 
     # --- min_lead_seizures gate ---
     strict = inventory_from_summary(summary, min_lead_seizures=2)
