@@ -110,7 +110,7 @@ NOTCH_ENABLED: bool = True         # kept for reproducibility; inert given the p
 # NEVER cross an inter-file gap (see section 6 continuity).
 WINDOW_SECONDS: float = 6.0                                   # default
 WINDOW_SECONDS_GRID: tuple[float, ...] = (4.0, 6.0, 8.0, 10.0)  # train/val-only sweep
-WINDOW_OVERLAP: float = 0.40                                  # 40% overlap
+WINDOW_OVERLAP: float = 0.00                                  # 40% overlap
 
 
 def window_samples(seconds: float = WINDOW_SECONDS) -> int:
@@ -247,7 +247,7 @@ LEAD_SEIZURE_MIN_PRECEDING_SECONDS: int = 4 * 3600
 # enough for stable anchor estimation and to give the balancing step real
 # diversity. Do NOT collapse to a class ratio here; balancing happens later,
 # in-fold, on the small 486-D distance features.
-INTERICTAL_POOL_MULTIPLIER: float = 5.0   # pool ~= 5 x the preictal window count
+INTERICTAL_POOL_MULTIPLIER: float = 3.0   # pool ~= 5 x the preictal window count
 INTERICTAL_POOL_STRATIFY: str = "recording_file"  # spread across files / time-of-day
 INTERICTAL_POOL_SEED: int = SEED
 

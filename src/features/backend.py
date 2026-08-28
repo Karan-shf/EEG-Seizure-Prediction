@@ -40,6 +40,12 @@ Public surface (all take/return NumPy float64 arrays, batched over leading dims)
     eigvalsh(C)                           ascending eigenvalues
     airm_distance(P, Q)                   delta_R = || log(eig(P^-1 Q)) ||_2
     frechet_mean(mats, *, axis=0, weights=None)   AIRM Karcher mean
+    logdet_spd(C)                         log det(C) via Cholesky (batched)
+    jbld_divergence(P, Q) / jbld_distance(P, Q)   Stein/JBLD divergence and its
+                                           sqrt (a genuine metric); affine-
+                                           invariant like AIRM, cheaper (no
+                                           eigendecomposition -- see the block
+                                           below airm_distance for rationale)
 """
 
 from __future__ import annotations
@@ -270,6 +276,101 @@ def airm_distance(P, Q) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Jensen-Bregman LogDet Divergence (JBLD / "Stein divergence") -- an optional,
+# cheaper substitute for AIRM (Sra, "A new metric on the manifold of kernel
+# matrices...", 2012). This is a Tier-2 performance change: the benchmark
+# showed AIRM's `distances` step (2 eigh calls x 2 references + 1 more for
+# baseline = up to 5 batched eigh calls per window) dominating wall-clock,
+# far outweighing rsmmtn+spd+recenter combined.
+#
+# JBLD needs only a Cholesky factorization per matrix -- no eigenvectors are
+# reconstructed, just the triangular factor's diagonal -- which is
+# algorithmically cheaper than a full symmetric eigendecomposition at the same
+# matrix size. It is ALSO affine-invariant, exactly like AIRM:
+#     JBLD(A P A^T, A Q A^T) == JBLD(P, Q)   for any invertible A
+# so the existing G^-1/2 . C . G^-1/2 recentering in alignment.py remains
+# mathematically valid, unchanged, under this metric -- see the "affine
+# invariance" self-test assertion below.
+#
+# This block is purely ADDITIVE: airm_distance / frechet_mean above are
+# untouched (anchor construction still uses the AIRM Karcher mean -- it is
+# cheap in aggregate, built only a handful of times, and was not the measured
+# bottleneck). Only the per-window DISTANCE measurement in distances.py is
+# switched to call jbld_distance() instead of airm_distance() -- see that
+# module for the (commented, not deleted) AIRM call sites.
+# ---------------------------------------------------------------------------
+def _logdet_spd_np(C) -> np.ndarray:
+    C = symmetrize(C)
+    n = C.shape[-1]
+    # tiny diagonal jitter: Cholesky (unlike eigh + clip) hard-fails on a
+    # matrix that is symmetric but not numerically positive-definite, which
+    # roundoff (especially in float32) can produce after a congruence
+    # transform. This costs nothing and matches the same _EPS floor the
+    # eigh-based path already clips to.
+    L = np.linalg.cholesky(C + _EPS * np.eye(n))
+    diag = np.diagonal(L, axis1=-2, axis2=-1)
+    return 2.0 * np.sum(np.log(np.clip(diag, _EPS, None)), axis=-1)
+
+
+def _logdet_spd_torch(C) -> np.ndarray:
+    torch = _torch()
+    assert torch is not None
+    dev = effective_device()
+    dtype = torch.float64 if _double() else torch.float32
+    Ct = torch.as_tensor(np.asarray(C), dtype=dtype, device=dev)
+    Ct = 0.5 * (Ct + Ct.transpose(-1, -2))
+    lead = Ct.shape[:-2]
+    n = Ct.shape[-1]
+    flat = Ct.reshape(-1, n, n)
+    jitter = torch.eye(n, dtype=dtype, device=dev) * _EPS
+    batch = int(cfg.EIGH_BATCH_SIZE)
+    outs = []
+    for i in range(0, flat.shape[0], batch):
+        chunk = flat[i:i + batch] + jitter
+        L = torch.linalg.cholesky(chunk)
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        outs.append(2.0 * torch.sum(torch.log(torch.clamp(diag, min=_EPS)), dim=-1))
+    out = torch.cat(outs, dim=0).reshape(*lead)
+    return out.detach().to("cpu", dtype=torch.float64).numpy()
+
+
+def logdet_spd(C) -> np.ndarray:
+    """log det(C) for batched SPD matrices, via Cholesky (batched over leading
+    dims, mirroring eigvalsh). Exposed publicly so callers can compute a
+    window's or a reference's log-det ONCE and reuse it across multiple JBLD
+    comparisons instead of recomputing it per (window, reference) pair -- a
+    further optimization available on top of the base metric swap; see the
+    note in distances.py.
+    """
+    if _use_torch():
+        return _logdet_spd_torch(C)
+    return _logdet_spd_np(C)
+
+
+def jbld_divergence(P, Q) -> np.ndarray:
+    """Jensen-Bregman LogDet Divergence (symmetric Stein divergence), Sra 2012:
+        JBLD(P, Q) = log det((P+Q)/2) - 0.5 * (log det P + log det Q)
+    Non-negative for SPD P, Q; zero iff P == Q. NOT itself a metric (fails the
+    triangle inequality in general) -- see jbld_distance() for the metric
+    version. P, Q broadcast over leading dims, mirroring airm_distance.
+    """
+    P = _np(P)
+    Q = _np(Q)
+    avg = symmetrize(0.5 * (P + Q))
+    return logdet_spd(avg) - 0.5 * (logdet_spd(P) + logdet_spd(Q))
+
+
+def jbld_distance(P, Q) -> np.ndarray:
+    """sqrt(JBLD(P, Q)). Sra (2012) shows the square root of the S-divergence
+    satisfies the triangle inequality (a genuine metric), unlike the raw
+    divergence -- so this, not jbld_divergence(), is the drop-in replacement
+    for airm_distance() as a `deltaR`-style feature.
+    """
+    div = jbld_divergence(P, Q)
+    return np.sqrt(np.clip(div, 0.0, None))
+
+
+# ---------------------------------------------------------------------------
 # Frechet (Karcher) mean under AIRM
 # ---------------------------------------------------------------------------
 def frechet_mean(mats, *, axis: int = 0, weights=None, max_iter: int | None = None , tol: float | None = None) -> np.ndarray:
@@ -363,6 +464,28 @@ if __name__ == "__main__":
     ref_eigs = np.linalg.eigvals(np.linalg.solve(P, Q)).real
     d_ref = np.sqrt(np.sum(np.log(np.clip(ref_eigs, _EPS, None)) ** 2))
     assert np.allclose(d_plain, d_ref, atol=1e-6)
+
+    # --- JBLD (Stein divergence): zero, symmetry, affine invariance, reference ---
+    assert abs(float(jbld_distance(P, P))) < 1e-9
+    assert np.allclose(jbld_distance(P, Q), jbld_distance(Q, P), atol=1e-9)
+
+    d_plain_jbld = jbld_distance(P, Q)
+    d_congr_jbld = jbld_distance(W @ P @ W.T, W @ Q @ W.T)
+    assert np.allclose(d_plain_jbld, d_congr_jbld, atol=1e-6), "JBLD must be affine-invariant"
+
+    logdet_p_ref = float(np.linalg.slogdet(P)[1])
+    logdet_q_ref = float(np.linalg.slogdet(Q)[1])
+    logdet_avg_ref = float(np.linalg.slogdet(0.5 * (P + Q))[1])
+    ref_jbld = logdet_avg_ref - 0.5 * (logdet_p_ref + logdet_q_ref)
+    assert ref_jbld >= -1e-9, "JBLD divergence must be non-negative for SPD inputs"
+    assert np.allclose(jbld_divergence(P, Q), ref_jbld, atol=1e-6)
+    assert np.allclose(jbld_distance(P, Q), np.sqrt(max(ref_jbld, 0.0)), atol=1e-6)
+
+    # batched logdet_spd matches np.linalg.slogdet
+    Cb = rand_spd((4,))
+    sign_ref, logdet_ref = np.linalg.slogdet(Cb)
+    assert np.all(sign_ref > 0), "synthetic SPD batch must have positive determinant"
+    assert np.allclose(logdet_spd(Cb), logdet_ref, atol=1e-6)
 
     # --- Frechet mean ---
     C1 = rand_spd()

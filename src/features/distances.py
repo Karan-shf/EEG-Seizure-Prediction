@@ -49,19 +49,29 @@ _EPS = 1e-12
 
 
 def baseline_distances(cp: np.ndarray) -> np.ndarray:
-    """delta_R(C', I) = sqrt(sum(log(eig C')^2)), batched over (..., nc, sr).
+    """delta(C', I) = distance from the window to its own (recentered) baseline.
+
+    Currently JBLD (Tier-2 swap, see backend.py): sqrt(JBLD(C', I)); since
+    log det(I) = 0 this is sqrt(log det((C'+I)/2) - 0.5*log det(C')).
 
     cp : (..., dim, dim) recentered SPD; returns (...,) with the two matrix axes
     reduced. Fold-invariant (cacheable).
     """
-    w = bk.eigvalsh(cp)
-    logw = np.log(np.clip(w, _EPS, None))
-    return np.sqrt(np.sum(logw * logw, axis=-1))
+    # --- AIRM (original): deltaR(C', I) = sqrt(sum(log(eig C')^2)) ---
+    # w = bk.eigvalsh(cp)
+    # logw = np.log(np.clip(w, _EPS, None))
+    # return np.sqrt(np.sum(logw * logw, axis=-1))
+
+    eye = np.eye(cp.shape[-1])
+    return bk.jbld_distance(cp, eye)
 
 
 def population_distances(cp: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """delta_R(C', M) to a single population reference M (broadcast over windows)."""
-    return bk.airm_distance(cp, M)
+    """delta(C', M) to a single population reference M (broadcast over windows)."""
+    # --- AIRM (original) ---
+    # return bk.airm_distance(cp, M)
+
+    return bk.jbld_distance(cp, M)
 
 
 def window_distances(cp: np.ndarray, references: ReferenceSet) -> np.ndarray:
@@ -142,8 +152,11 @@ if __name__ == "__main__":
     eye_cs = np.broadcast_to(np.eye(n), (nc, sr, n, n)).copy()
     assert np.allclose(baseline_distances(eye_cs), 0.0, atol=1e-9)
     cp = rand_spd((nc, sr))
+    # --- AIRM (original) ---
+    # assert np.allclose(baseline_distances(cp),
+    #                    bk.airm_distance(cp, eye_cs), atol=1e-8)
     assert np.allclose(baseline_distances(cp),
-                       bk.airm_distance(cp, eye_cs), atol=1e-8)
+                       bk.jbld_distance(cp, eye_cs), atol=1e-8)
 
     # --- build a reference set and check window_distances ---
     pms = []
@@ -158,8 +171,11 @@ if __name__ == "__main__":
     assert np.all(D >= 0.0)
     # column order matches names
     assert np.allclose(D[..., R.names.index("baseline")], baseline_distances(cp), atol=1e-9)
+        # --- AIRM (original) ---
+    # assert np.allclose(D[..., R.names.index("preictal")],
+    #                    bk.airm_distance(cp, R.get("preictal")), atol=1e-8)
     assert np.allclose(D[..., R.names.index("preictal")],
-                       bk.airm_distance(cp, R.get("preictal")), atol=1e-8)
+                       bk.jbld_distance(cp, R.get("preictal")), atol=1e-8)
 
     # --- feature vector length + flatten order ---
     m = 2
