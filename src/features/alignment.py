@@ -56,7 +56,9 @@ def patient_baseline(interictal_spd: np.ndarray, *, max_iter: int | None = None,
         )
     if X.shape[0] < 1:
         raise ValueError("need at least one interictal window to form a baseline")
-    G = bk.frechet_mean(X, axis=0, max_iter=max_iter, tol=tol)
+        # --- AIRM Karcher mean (original) ---
+    # G = bk.frechet_mean(X, axis=0, max_iter=max_iter, tol=tol)
+    G = bk.log_euclidean_mean(X, axis=0, max_iter=max_iter, tol=tol)
     log.info(
         "patient_baseline: G from %d interictal windows -> %s (method=%s, %s)",
         X.shape[0], G.shape, cfg.RECENTER_METHOD, cfg.RECENTER_GRANULARITY,

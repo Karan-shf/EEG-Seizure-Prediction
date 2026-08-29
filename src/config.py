@@ -210,7 +210,13 @@ RIEMANN_MEAN_MAX_ITER: int = 15   # was 50 -- each iteration re-pays a per-windo
 RIEMANN_MEAN_TOL: float = 1e-4    # was 1e-6 -- a downstream logistic regression won't
                                    # notice anchor precision tighter than this
 ANCHOR_SCOPE: str = "train_fold_only"    # M_interictal / M_preictal: source patients only
-
+# Which algorithm builds G_patient / M_interictal / M_preictal. "log_euclidean"
+# (current) is closed-form and needs exactly ONE pass over a patient's windows;
+# "airm_karcher" is the original iterative Karcher mean (backend.frechet_mean /
+# dataset_builder.streaming_frechet_mean, still present, unused by default).
+# Included in dataset_builder._fingerprint() so switching this invalidates any
+# stale cached anchors automatically.
+ANCHOR_MEAN_METHOD: str = "log_euclidean"
 
 def feature_dim(span_roof: int) -> int:
     """Distance-to-reference feature width for a cumulative span roof m.

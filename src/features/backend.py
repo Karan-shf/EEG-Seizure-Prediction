@@ -422,6 +422,45 @@ def frechet_mean(mats, *, axis: int = 0, weights=None, max_iter: int | None = No
             break
     return M
 
+def log_euclidean_mean(mats, *, axis: int = 0, weights=None,
+                        max_iter: int | None = None, tol: float | None = None) -> np.ndarray:
+    """Log-Euclidean mean of SPD matrices along `axis`: exp(weighted average of
+    log(C_i)). NOT the AIRM Frechet/Karcher mean above -- a different (flat,
+    non-curved) mean on the SPD manifold (Arsigny et al. 2006), used here for
+    exactly the reason they proposed it: closed-form, needs exactly ONE pass
+    over the data (each matrix's log computed once, averaged, exponentiated
+    once) instead of frechet_mean's iterative multi-pass Karcher refinement.
+
+    `max_iter` / `tol` are accepted and ignored -- there is no iteration to
+    control -- purely so this is a drop-in replacement at call sites that
+    still pass them.
+    """
+    X = np.moveaxis(_np(mats), axis, 0)
+    K = X.shape[0]
+    if K == 0:
+        raise ValueError("log_euclidean_mean requires at least one matrix")
+
+    if weights is None:
+        w = np.full(K, 1.0 / K, dtype=np.float64)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.shape != (K,):
+            raise ValueError(f"weights must have shape ({K},), got {w.shape}")
+        if np.any(w < 0):
+            raise ValueError("weights must be non-negative")
+        s = w.sum()
+        if s <= 0:
+            raise ValueError("weights must sum to a positive value")
+        w = w / s
+    w_b = w.reshape((K,) + (1,) * (X.ndim - 1))
+
+    if K == 1:
+        return symmetrize(X[0])
+
+    logs = spd_log(X)                       # batched: log of all K at once
+    mean_log = np.sum(w_b * logs, axis=0)
+    return symmetrize(spd_exp(mean_log))
+
 
 # ---------------------------------------------------------------------------
 # Self-test (NumPy path; no torch / scipy / pyriemann required)
@@ -497,6 +536,13 @@ if __name__ == "__main__":
     fm = frechet_mean(Xd, axis=0)
     expected = np.diag(np.exp(np.mean(np.log(d), axis=0)))   # geometric mean on the diagonal
     assert np.allclose(fm, expected, atol=1e-7)
+
+    # --- log_euclidean_mean: closed-form, matches AIRM Karcher EXACTLY for
+    # commuting (diagonal) matrices -- both reduce to the elementwise
+    # geometric mean when eigenvectors are shared, a nice free sanity check ---
+    lem = log_euclidean_mean(Xd, axis=0)
+    assert np.allclose(lem, expected, atol=1e-7)
+    assert np.allclose(lem, fm, atol=1e-7), "must coincide with AIRM mean on commuting matrices"
 
     # batched (channel x span) Frechet mean stays SPD
     Xb = rand_spd((K, 3, 2))                # (K, nc, sr, n, n)

@@ -91,8 +91,11 @@ def patient_reference_means(
             f"interictal/preictal (channel, span, dim) mismatch: "
             f"{inter.shape[1:]} vs {pre.shape[1:]}"
         )
-    m_int = bk.frechet_mean(inter, axis=0, max_iter=max_iter, tol=tol)
-    m_pre = bk.frechet_mean(pre, axis=0, max_iter=max_iter, tol=tol)
+    # --- AIRM Karcher mean (original) ---
+    # m_int = bk.frechet_mean(inter, axis=0, max_iter=max_iter, tol=tol)
+    # m_pre = bk.frechet_mean(pre, axis=0, max_iter=max_iter, tol=tol)
+    m_int = bk.log_euclidean_mean(inter, axis=0, max_iter=max_iter, tol=tol)
+    m_pre = bk.log_euclidean_mean(pre, axis=0, max_iter=max_iter, tol=tol)
     log.info(
         "patient_reference_means[%s]: interictal from %d, preictal from %d windows",
         patient_id, inter.shape[0], pre.shape[0],
@@ -159,8 +162,11 @@ def build_fold_references(
     inter_stack = np.stack([pm.interictal_mean for pm in srcs])   # (P, nc, sr, d, d)
     pre_stack = np.stack([pm.preictal_mean for pm in srcs])
     # Equal weight per patient (weights=None) -> level-2 Frechet mean.
-    m_interictal = bk.frechet_mean(inter_stack, axis=0, max_iter=max_iter, tol=tol)
-    m_preictal = bk.frechet_mean(pre_stack, axis=0, max_iter=max_iter, tol=tol)
+    # --- AIRM Karcher mean (original) ---
+    # m_interictal = bk.frechet_mean(inter_stack, axis=0, max_iter=max_iter, tol=tol)
+    # m_preictal = bk.frechet_mean(pre_stack, axis=0, max_iter=max_iter, tol=tol)
+    m_interictal = bk.log_euclidean_mean(inter_stack, axis=0, max_iter=max_iter, tol=tol)
+    m_preictal = bk.log_euclidean_mean(pre_stack, axis=0, max_iter=max_iter, tol=tol)
 
     nc, sr, d, _ = shape
     eye = np.broadcast_to(np.eye(d), (nc, sr, d, d)).copy()

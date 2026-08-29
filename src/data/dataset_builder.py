@@ -72,7 +72,7 @@ def _fingerprint() -> str:
     parts = (
         cfg.SPD_DIM, cfg.N_CHANNELS, cfg.SPAN_MAX,
         cfg.RECENTER_METHOD, cfg.RECENTER_GRANULARITY, cfg.RECENTER_ANCHOR_STATE,
-        cfg.RIEMANN_METRIC, cfg.RIEMANN_MEAN_MAX_ITER, cfg.RIEMANN_MEAN_TOL,
+        cfg.RIEMANN_METRIC, cfg.RIEMANN_MEAN_MAX_ITER, cfg.RIEMANN_MEAN_TOL, cfg.ANCHOR_MEAN_METHOD,
         cfg.N_REFERENCES, tuple(cfg.REFERENCE_NAMES), tuple(cfg.CHANNELS),
     )
     return hashlib.sha1(repr(parts).encode()).hexdigest()[:16]
@@ -130,6 +130,33 @@ def streaming_frechet_mean(
     return mean
 
 
+def streaming_log_euclidean_mean(
+    stream_factory: Callable[[], Iterator[np.ndarray]],
+) -> np.ndarray:
+    """Log-Euclidean mean over a re-iterable stream of SPD matrices -- ONE PASS.
+
+    Accumulates the running sum of each window's matrix log, divides by count,
+    exponentiates once at the end. Unlike streaming_frechet_mean (AIRM Karcher,
+    which re-streams -- and therefore re-loads / re-filters / re-featurizes --
+    every window once per iteration, up to RIEMANN_MEAN_MAX_ITER times), this
+    never re-streams. This is what fixes both the redundant rsmmtn/spd
+    recomputation AND the signal LRU-cache thrashing the multi-pass design
+    caused.
+    """
+    log_sum = None
+    count = 0
+    for C in stream_factory():
+        C = np.asarray(C, dtype=float)
+        logC = bk.spd_log(C)
+        log_sum = logC.copy() if log_sum is None else log_sum + logC
+        count += 1
+    if count == 0:
+        raise ValueError("empty stream for log-Euclidean mean")
+    assert log_sum is not None
+    mean_log = log_sum / count
+    return bk.symmetrize(bk.spd_exp(mean_log))
+
+
 # ---------------------------------------------------------------------------
 # Per-patient fold-invariant artifacts (cached)
 # ---------------------------------------------------------------------------
@@ -144,9 +171,16 @@ def _preictal(provider, pid):
 def patient_g(provider: SpdWindowProvider, pid: str, *, fingerprint=None) -> np.ndarray:
     """g_patient: interictal Frechet mean, per (channel x span). Fold-invariant."""
     fp = fingerprint or _fingerprint()
+
+    # --- AIRM Karcher mean (original, multi-pass) ---
+    # return cache.get_or_compute(
+    #     "g_patient", pid,
+    #     lambda: streaming_frechet_mean(lambda: _interictal(provider, pid)),
+    #     fingerprint=fp,
+    # )
     return cache.get_or_compute(
         "g_patient", pid,
-        lambda: streaming_frechet_mean(lambda: _interictal(provider, pid)),
+        lambda: streaming_log_euclidean_mean(lambda: _interictal(provider, pid)),
         fingerprint=fp,
     )
 
@@ -180,10 +214,17 @@ def patient_anchor_means(provider, pid, *, fingerprint=None) -> refs.PatientRefe
 
     def compute():
         g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fp))
-        m_int = streaming_frechet_mean(
+        # --- AIRM Karcher mean (original, multi-pass) ---
+        # m_int = streaming_frechet_mean(
+        #     lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+        #              for C in _interictal(provider, pid)))
+        # m_pre = streaming_frechet_mean(
+        #     lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+        #              for C in _preictal(provider, pid)))
+        m_int = streaming_log_euclidean_mean(
             lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
                      for C in _interictal(provider, pid)))
-        m_pre = streaming_frechet_mean(
+        m_pre = streaming_log_euclidean_mean(
             lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
                      for C in _preictal(provider, pid)))
         return refs.PatientReferenceMeans(
