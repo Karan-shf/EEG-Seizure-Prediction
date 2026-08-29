@@ -95,7 +95,7 @@ class ChbSpdProvider:
                  window_seconds: Optional[float] = None,
                  overlap: Optional[float] = None,
                  apply_notch: bool = False,
-                 signal_cache_size: int = 3,
+                 signal_cache_size: int = 50,
                  operator: Optional[laplacian.LaplacianOperator] = None) -> None:
         if not 0.0 <= float(alpha) <= 1.0:
             raise ValueError(f"alpha must be in [0, 1], got {alpha}")

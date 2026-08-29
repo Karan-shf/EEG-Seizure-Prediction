@@ -107,7 +107,8 @@ def streaming_frechet_mean(
     if count == 1:
         return mean
 
-    for _ in range(int(max_iter)):
+    iter_step = None
+    for iteration in range(int(max_iter)):
         m_sqrt = bk.spd_sqrt(mean)
         m_invsqrt = bk.spd_invsqrt(mean)
         tangent = np.zeros_like(mean)
@@ -119,9 +120,13 @@ def streaming_frechet_mean(
             n += 1
         tangent = tangent / n
         mean = bk.symmetrize(m_sqrt @ bk.spd_exp(tangent) @ m_sqrt)
-        step = float(np.sqrt(np.sum(tangent * tangent, axis=(-2, -1))).max())
-        if step < tol:
+        iter_step = float(np.sqrt(np.sum(tangent * tangent, axis=(-2, -1))).max())
+        log.info("streaming_frechet_mean: iter=%d n_windows=%d step=%.3e", iteration, n, iter_step)
+        if iter_step < tol:
             break
+    else:
+        log.warning("streaming_frechet_mean: hit max_iter=%d without converging "
+                    "(final step=%.3e >= tol=%.3e)", max_iter, iter_step, tol)
     return mean
 
 

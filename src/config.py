@@ -196,7 +196,7 @@ RECENTER_ANCHOR_STATE: str = "interictal"      # label-free calibration only
 #   deltaR(P, Q) = || log( eigvals( P^-1 Q ) ) ||_2
 N_REFERENCES: int = 3             # baseline (I), interictal mean, preictal mean
 REFERENCE_NAMES: tuple[str, ...] = ("baseline", "interictal", "preictal")
-RIEMANN_METRIC: str = "airm"      # affine-invariant Riemannian metric
+RIEMANN_METRIC: str = "jbld"      # Jensen-Bregman LogDet Divergence
 
 # The two population anchors (M_interictal, M_preictal) are Riemannian (Frechet)
 # means, computed per (channel x span) from TRAINING-fold (source) patients only
@@ -204,8 +204,11 @@ RIEMANN_METRIC: str = "airm"      # affine-invariant Riemannian metric
 # G_patient -- and recomputed fresh inside every LOPO fold. G_patient itself is
 # patient-local (that patient's own interictal windows) and may be formed for
 # the held-out patient too (uses only their own unlabeled baseline).
-RIEMANN_MEAN_MAX_ITER: int = 50
-RIEMANN_MEAN_TOL: float = 1e-6
+RIEMANN_MEAN_MAX_ITER: int = 15   # was 50 -- each iteration re-pays a per-window eigh
+                                   # call in the streaming Karcher mean; iteration count
+                                   # directly multiplies anchor-build wall-clock
+RIEMANN_MEAN_TOL: float = 1e-4    # was 1e-6 -- a downstream logistic regression won't
+                                   # notice anchor precision tighter than this
 ANCHOR_SCOPE: str = "train_fold_only"    # M_interictal / M_preictal: source patients only
 
 

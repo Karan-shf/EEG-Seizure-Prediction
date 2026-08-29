@@ -330,7 +330,7 @@ def _logdet_spd_torch(C) -> np.ndarray:
         L = torch.linalg.cholesky(chunk)
         diag = torch.diagonal(L, dim1=-2, dim2=-1)
         outs.append(2.0 * torch.sum(torch.log(torch.clamp(diag, min=_EPS)), dim=-1))
-    out = torch.cat(outs, dim=0).reshape(*lead)
+    out = torch.cat(outs, dim=0).reshape(tuple(lead))
     return out.detach().to("cpu", dtype=torch.float64).numpy()
 
 
