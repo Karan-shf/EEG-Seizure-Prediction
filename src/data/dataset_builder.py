@@ -192,46 +192,79 @@ class PatientBaseline:
     d_baseline: np.ndarray      # (n_windows, n_channels, span_roof)
 
 
+def _pass2_artifacts(provider, pid, *, fingerprint=None):
+    """The combined level-1 second pass: ONE stream over the patient's windows
+    that builds BOTH d_baseline AND both (interictal/preictal) anchor means
+    together, instead of the original 3 independent re-streams (d_baseline
+    alone, an interictal-only filtered stream, a preictal-only filtered
+    stream) each separately re-paying rsmmtn+spd+recenter. Each window's
+    recentered C' is computed exactly once and reused for everything it's
+    needed for -- which also means no window's front-end work is ever wasted
+    computing a label it doesn't end up using (the old filtered streams paid
+    the full rsmmtn+spd cost on every window BEFORE checking its label).
+
+    Populates the SAME two on-disk cache kinds ("d_baseline",
+    "patient_anchor_means") the previous independent functions used, so the
+    disk layout, fingerprint behavior, and existing self-test assertions are
+    all unchanged -- only the computation that fills them is merged.
+    """
+    fp = fingerprint or _fingerprint()
+
+    cached_baseline = (cache.load("d_baseline", pid, fingerprint=fp)
+                       if cache.has("d_baseline", pid, fingerprint=fp) else None)
+    cached_means = (cache.load("patient_anchor_means", pid, fingerprint=fp)
+                    if cache.has("patient_anchor_means", pid, fingerprint=fp) else None)
+    if cached_baseline is not None and cached_means is not None:
+        return cached_baseline, cached_means
+
+    g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fp))
+    d_list, y_list = [], []
+    log_sum_int = None
+    log_sum_pre = None
+    n_int = 0
+    n_pre = 0
+    for (C, lab) in provider.iter_windows(pid):
+        cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+        d_list.append(dist.baseline_distances(cp))          # (nc, sr)
+        y_list.append(int(lab))
+        logC = bk.spd_log(cp)                                # shared by both anchors' accumulator
+        if lab == 0:
+            log_sum_int = logC.copy() if log_sum_int is None else log_sum_int + logC
+            n_int += 1
+        else:
+            log_sum_pre = logC.copy() if log_sum_pre is None else log_sum_pre + logC
+            n_pre += 1
+
+    if n_int == 0 or n_pre == 0:
+        raise ValueError(f"{pid}: need >=1 interictal AND >=1 preictal window "
+                          f"to build both anchors (got {n_int} interictal, "
+                          f"{n_pre} preictal)")
+
+    assert log_sum_int is not None and log_sum_pre is not None
+    baseline = PatientBaseline(pid, np.asarray(y_list, dtype=int), np.stack(d_list))
+    m_int = bk.symmetrize(bk.spd_exp(log_sum_int / n_int))
+    m_pre = bk.symmetrize(bk.spd_exp(log_sum_pre / n_pre))
+    means = refs.PatientReferenceMeans(
+        patient_id=pid, channels=tuple(provider.channels()),
+        interictal_mean=m_int, preictal_mean=m_pre)
+
+    cache.save("d_baseline", pid, baseline, fingerprint=fp)
+    cache.save("patient_anchor_means", pid, means, fingerprint=fp)
+    return baseline, means
+
+
 def patient_baseline_distances(provider, pid, *, fingerprint=None) -> PatientBaseline:
     """Per-window d_baseline = delta_R(C', I) + labels. Fold-invariant."""
     fp = fingerprint or _fingerprint()
-
-    def compute():
-        g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fp))
-        d_list, y_list = [], []
-        for (C, lab) in provider.iter_windows(pid):
-            cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-            d_list.append(dist.baseline_distances(cp))    # (nc, sr)
-            y_list.append(int(lab))
-        return PatientBaseline(pid, np.asarray(y_list, dtype=int), np.stack(d_list))
-
-    return cache.get_or_compute("d_baseline", pid, compute, fingerprint=fp)
+    baseline, _means = _pass2_artifacts(provider, pid, fingerprint=fp)
+    return baseline
 
 
 def patient_anchor_means(provider, pid, *, fingerprint=None) -> refs.PatientReferenceMeans:
-    """Level-1 interictal/preictal Frechet means (recentered). Fold-invariant."""
+    """Level-1 interictal/preictal (Log-Euclidean) means (recentered). Fold-invariant."""
     fp = fingerprint or _fingerprint()
-
-    def compute():
-        g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fp))
-        # --- AIRM Karcher mean (original, multi-pass) ---
-        # m_int = streaming_frechet_mean(
-        #     lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-        #              for C in _interictal(provider, pid)))
-        # m_pre = streaming_frechet_mean(
-        #     lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-        #              for C in _preictal(provider, pid)))
-        m_int = streaming_log_euclidean_mean(
-            lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-                     for C in _interictal(provider, pid)))
-        m_pre = streaming_log_euclidean_mean(
-            lambda: (al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-                     for C in _preictal(provider, pid)))
-        return refs.PatientReferenceMeans(
-            patient_id=pid, channels=tuple(provider.channels()),
-            interictal_mean=m_int, preictal_mean=m_pre)
-
-    return cache.get_or_compute("patient_anchor_means", pid, compute, fingerprint=fp)
+    _baseline, means = _pass2_artifacts(provider, pid, fingerprint=fp)
+    return means
 
 
 # ---------------------------------------------------------------------------
