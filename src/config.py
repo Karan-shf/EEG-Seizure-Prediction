@@ -399,7 +399,7 @@ SWEEP_SOP_MINUTES: tuple[int, ...] = (SOP_PRIMARY_MINUTES,)   # frozen -> SOP_GR
 #         "cpu"
 #     )
 #
-COMPUTE_BACKEND: str = "auto"     # "auto" -> cuda|mps|cpu ; or force "cpu"/"cuda"/"mps"/"numpy"
+COMPUTE_BACKEND: str = "cpu"     # "auto" -> cuda|mps|cpu ; or force "cpu"/"cuda"/"mps"/"numpy"
 COMPUTE_DTYPE: str = "float64"    # manifold-math precision (AIRM / Frechet means): float64 everywhere
 EIGH_BATCH_SIZE: int = 4096       # matrices per batched eigh call on GPU (tune to available VRAM)
 
@@ -447,7 +447,23 @@ CACHE_FOLD_INVARIANT: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# 11. Convenience summary
+# 11. Tier-2 CPU multiprocessing (patient-parallel level-1 / level-2 sweeps)
+# ---------------------------------------------------------------------------
+# Worker-process count is NEVER hard-coded at a call site -- every driver
+# reads it via src.utils.parallel.resolve_n_workers(), which reads these two
+# values, so moving to different hardware is a one-line config edit.
+#
+# N_WORKER_PROCESSES = None -> auto-detect: PHYSICAL core count (hyperthread
+# siblings share execution units and buy little for this dense floating-point
+# workload) minus MULTIPROCESSING_RESERVED_CORES, floored at 1. Set an
+# explicit int to override auto-detection for a specific machine.
+N_WORKER_PROCESSES: int | None = None
+# Cores intentionally left unallocated (OS / orchestrator headroom).
+MULTIPROCESSING_RESERVED_CORES: int = 2
+
+
+# ---------------------------------------------------------------------------
+# 12. Convenience summary
 # ---------------------------------------------------------------------------
 def summary() -> str:
     """Return a human-readable dump of the most important derived settings."""
