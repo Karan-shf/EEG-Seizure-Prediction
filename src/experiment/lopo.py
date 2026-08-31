@@ -279,8 +279,8 @@ def run_lopo(*, alpha: float, span_roof: Optional[int] = None,
                    if target_fpr_per_hour is None else target_fpr_per_hour)
     seed = cfg.SEED if seed is None else int(seed)
     mode = str(mode).lower()
-    if mode not in ("exact", "fast"):
-        raise ValueError(f"mode must be 'exact' or 'fast', got {mode!r}")
+    if mode not in ("exact", "fast", "precomputed"):
+        raise ValueError(f"mode must be 'exact', 'fast', or 'precomputed', got {mode!r}")
 
     if provider is None:
         pats = tuple(patients) if patients else DEFAULT_PATIENTS
@@ -311,8 +311,12 @@ def run_lopo(*, alpha: float, span_roof: Optional[int] = None,
     log.info("run_lopo: alpha=%.2f span_roof=%d mode=%s patients=%d",
              float(alpha), span_roof, mode, len(patient_ids))
     for test_patient in patient_ids:
-        fold = db.build_fold(provider, test_patient, span_roof=span_roof,
-                             fingerprint=fp, fast=(mode == "fast"), alpha=alpha)
+        if mode == "precomputed":
+            fold = db.build_fold_precomputed(provider, test_patient, span_roof=span_roof,
+                                            fingerprint=fp, alpha=alpha)
+        else:
+            fold = db.build_fold(provider, test_patient, span_roof=span_roof,
+                                fingerprint=fp, fast=(mode == "fast"), alpha=alpha)
         y_train = np.asarray(fold.y_train)
         if fold.X_train.shape[0] == 0 or np.unique(y_train).size < 2:
             log.warning("skip fold %s: degenerate training set", test_patient)

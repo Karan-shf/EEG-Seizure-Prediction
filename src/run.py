@@ -255,9 +255,13 @@ def _add_common(sp: argparse.ArgumentParser, *, with_eligible: bool) -> None:
                     help=f"target FPR/h (default: {cfg.PRIMARY_TARGET_FPR_PER_HOUR})")
     sp.add_argument("--seed", type=int, default=None,
                     help=f"random seed (default: {cfg.SEED})")
-    sp.add_argument("--mode", choices=("exact", "fast"), default=cfg.FEATURE_ANCHOR_MODE,
+    sp.add_argument("--mode", choices=("exact", "fast", "precomputed"), default=cfg.FEATURE_ANCHOR_MODE,
                     help="feature-anchor mode: 'fast' = Tier-1 purist cached global "
-                         f"anchor (~10x less streaming); default: {cfg.FEATURE_ANCHOR_MODE}")
+                         "anchor (~10x less streaming, small approximation); "
+                         "'precomputed' = exact per-fold leave-one-out anchors for "
+                         "EVERY fold, each patient streamed exactly once for the "
+                         "whole sweep -- same speed as 'fast' with zero approximation; "
+                         f"default: {cfg.FEATURE_ANCHOR_MODE}")
     if with_eligible:
         sp.add_argument("--eligible-only", action="store_true",
                         help="run inventory first and keep only eligible patients")

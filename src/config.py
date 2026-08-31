@@ -442,6 +442,7 @@ CACHE_DIR: Path = PROCESSED_DIR / "lopo_cache"   # created lazily by the cache m
 CACHE_FOLD_INVARIANT: tuple[str, ...] = (
     "clean_signal", "window_plan", "g_patient", "d_baseline", "patient_anchor_means",
     "global_anchor", "global_features", "loo_features",
+    "all_fold_references", "all_fold_features",
 )
 
 

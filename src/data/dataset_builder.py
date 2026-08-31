@@ -416,6 +416,152 @@ def patient_loo_features(provider, test_patient, *, references, fingerprint, tag
                                 fingerprint=fingerprint)
 
 
+# ---------------------------------------------------------------------------
+# Precomputed all-fold mode: build EVERY fold's true leave-one-out anchor up
+# front, then stream each patient's windows exactly ONCE for the WHOLE sweep
+# (not once per fold), scoring against every fold's anchor in one batched
+# call. Unlike fast mode, this is EXACT -- same per-fold anchor definition as
+# exact mode -- it just changes the ORDER work happens in (build every anchor
+# first, since that's cheap; then never re-stream a patient).
+# ---------------------------------------------------------------------------
+def build_all_fold_references(provider, patient_ids, *, fingerprint, tag):
+    """One TRUE leave-one-out ReferenceSet per possible test_patient, built
+    from already-cached level-1 patient_anchor_means. Cheap -- only averages
+    small already-built matrices, no raw windows touched. Cached as one blob
+    per (cohort, alpha) via `tag` (reuses fast mode's cohort+alpha tagging).
+    """
+    ids = list(patient_ids)
+
+    def compute():
+        pms = {p: patient_anchor_means(provider, p, fingerprint=fingerprint) for p in ids}
+        out = {}
+        for test_patient in ids:
+            source = [p for p in ids if p != test_patient]
+            out[test_patient] = refs.build_fold_references(
+                [pms[p] for p in source], channels=tuple(provider.channels()),
+                source_patient_ids=source)
+        return out
+
+    return cache.get_or_compute("all_fold_references", f"refs_{tag}", compute,
+                                fingerprint=fingerprint)
+
+
+def _patient_all_fold_distance_tensor(provider, pid, *, m_int_stack, m_pre_stack, fingerprint):
+    """Stream one patient's windows ONCE -> distances vs EVERY fold's anchor.
+
+    D : (n_windows, n_folds, n_channels, span, n_references) at full SPAN_MAX.
+    baseline is fold-invariant (read from the cached d_baseline column,
+    broadcast across the fold axis); interictal/preictal are each ONE batched
+    call per window against the STACKED (n_folds, nc, sr, dim, dim) reference
+    arrays -- paying JBLD's per-call overhead once per window, not once per
+    (window, fold) pair.
+    """
+    g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fingerprint))
+    base = patient_baseline_distances(provider, pid, fingerprint=fingerprint)
+    n_folds = m_int_stack.shape[0]
+
+    rows = []
+    idx = 0
+    for (C, _lab) in provider.iter_windows(pid):
+        cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+        d_base = base.d_baseline[idx]                                  # (nc, sr)
+        d_base_b = np.broadcast_to(d_base, (n_folds,) + d_base.shape)  # (nf, nc, sr)
+        d_int = dist.population_distances(cp, m_int_stack)             # (nf, nc, sr)
+        d_pre = dist.population_distances(cp, m_pre_stack)             # (nf, nc, sr)
+        rows.append(np.stack([d_base_b, d_int, d_pre], axis=-1))       # (nf, nc, sr, 3)
+        idx += 1
+
+    if rows:
+        D = np.stack(rows)                                             # (nw, nf, nc, sr, 3)
+    else:
+        nc, sr = m_int_stack.shape[1:3]
+        D = np.zeros((0, n_folds, nc, sr, cfg.N_REFERENCES), dtype=float)
+    return D, base.labels.copy()
+
+
+def patient_all_fold_features(provider, pid, *, fold_refs, fold_order, fingerprint, tag):
+    """Per-window distance tensor for `pid` vs ALL folds' true LOO anchors,
+    cached per (patient, cohort, alpha). `pid` is streamed at most once, EVER
+    -- across the whole LOPO sweep, not once per fold.
+    """
+    def compute():
+        m_int_stack = np.stack([fold_refs[f].get("interictal") for f in fold_order])
+        m_pre_stack = np.stack([fold_refs[f].get("preictal") for f in fold_order])
+        D, y = _patient_all_fold_distance_tensor(
+            provider, pid, m_int_stack=m_int_stack, m_pre_stack=m_pre_stack,
+            fingerprint=fingerprint)
+        return {"D": D, "y": y}
+
+    return cache.get_or_compute("all_fold_features", f"{pid}_{tag}", compute,
+                                fingerprint=fingerprint)
+
+
+def build_fold_precomputed(provider, test_patient, *, span_roof: int | None = None,
+                           fingerprint: str | None = None, alpha: float | None = None) -> FoldData:
+    """One LOPO fold, EXACT (matches build_fold(fast=False) bit-for-bit on
+    both train AND test), built entirely from precomputed all-fold features:
+    no streaming, no recentering, no distance computation happens in this
+    function -- it is pure array slicing. The FIRST call to this (for any
+    test_patient) pays for every patient's ONE streaming pass; every
+    subsequent call, for any other test_patient, hits cache only.
+    """
+    if alpha is None:
+        raise ValueError("build_fold_precomputed needs `alpha` for the cache key")
+    fp = fingerprint or _fingerprint()
+    ids = list(provider.patient_ids())
+    if test_patient not in ids:
+        raise ValueError(f"unknown test patient {test_patient!r}")
+    span_roof = cfg.SPAN_MAX if span_roof is None else int(span_roof)
+    channels = tuple(provider.channels())
+    tag = _fast_tag(ids, alpha)
+    fold_order = tuple(ids)
+
+    fold_refs = build_all_fold_references(provider, ids, fingerprint=fp, tag=tag)
+
+    Xtr, ytr, gtr = [], [], []
+    Xte, yte = None, None
+    for p in ids:
+        feats = patient_all_fold_features(provider, p, fold_refs=fold_refs,
+                                          fold_order=fold_order, fingerprint=fp, tag=tag)
+        f_idx = fold_order.index(test_patient)
+        D_f = feats["D"][:, f_idx]                       # (nw_p, nc, sr, n_refs)
+        X_p = _slice_features(D_f, span_roof)
+        if p == test_patient:
+            Xte, yte = X_p, feats["y"]
+        else:
+            Xtr.append(X_p)
+            ytr.append(feats["y"])
+            gtr.append(np.full(len(feats["y"]), p, dtype=object))
+
+    fnames = dist.feature_names(channels, span_roof)
+    width = cfg.N_REFERENCES * span_roof * len(channels)
+    source = tuple(p for p in ids if p != test_patient)
+
+    return FoldData(
+        test_patient=test_patient, source_patients=source,
+        span_roof=span_roof, feature_names=fnames,
+        X_train=np.concatenate(Xtr) if Xtr else np.empty((0, width)),
+        y_train=np.concatenate(ytr) if ytr else np.empty((0,), dtype=int),
+        train_patient_ids=np.concatenate(gtr) if gtr else np.empty((0,), dtype=object),
+        X_test=Xte if Xte is not None else np.empty((0, width)),
+        y_test=yte if yte is not None else np.empty((0,), dtype=int),
+        test_patient_ids=np.full(len(yte) if yte is not None else 0, test_patient, dtype=object),
+    )
+
+
+def build_lopo_precomputed(provider, *, span_roof: int | None = None,
+                           alpha: float | None = None) -> list[FoldData]:
+    """Every LOPO fold, built from ONE pass total over every patient's windows
+    (not one pass per fold). See build_fold_precomputed."""
+    fp = _fingerprint()
+    folds = [build_fold_precomputed(provider, p, span_roof=span_roof,
+                                    fingerprint=fp, alpha=alpha)
+             for p in provider.patient_ids()]
+    log.info("build_lopo_precomputed: %d folds, span_roof=%s", len(folds),
+             cfg.SPAN_MAX if span_roof is None else span_roof)
+    return folds
+
+
 def build_fold(provider: SpdWindowProvider, test_patient: str, *,
                span_roof: int | None = None, fingerprint: str | None = None,
                fast: bool = False, alpha: float | None = None) -> FoldData:
@@ -621,6 +767,26 @@ if __name__ == "__main__":
     # fast train narrows with span roof just like exact
     fold_fast_m1 = build_fold(provider, "A", span_roof=1, fast=True, alpha=0.5)
     assert fold_fast_m1.X_train.shape[1] == nc * 1 * n_refs
+
+    # --- precomputed (exact, all-fold) mode ---
+    # Unlike fast mode, this must match EXACT mode bit-for-bit on BOTH
+    # train and test -- it's only a caching/streaming-order change, not an
+    # approximation.
+    fold_pre_A = build_fold_precomputed(provider, "A", span_roof=sr, alpha=0.5)
+    assert fold_pre_A.X_test.shape == fold_exact.X_test.shape
+    assert np.allclose(fold_pre_A.X_test, fold_exact.X_test, atol=1e-9)
+    assert fold_pre_A.X_train.shape == fold_exact.X_train.shape
+    assert np.allclose(fold_pre_A.X_train, fold_exact.X_train, atol=1e-9), \
+        "precomputed mode must match exact mode's TRAIN features too (fast mode does not)"
+    assert np.array_equal(fold_pre_A.y_test, fold_exact.y_test)
+
+    folds_pre = build_lopo_precomputed(provider, span_roof=sr, alpha=0.5)
+    assert len(folds_pre) == len(provider.patient_ids())
+    assert {f.test_patient for f in folds_pre} == set(provider.patient_ids())
+    assert cache.has("all_fold_references", f"refs_{tag05}", fingerprint=fp)
+    assert cache.has("all_fold_features", f"B_{tag05}", fingerprint=fp)
+
+    import shutil
 
     import shutil
     shutil.rmtree(cfg.CACHE_DIR, ignore_errors=True)
