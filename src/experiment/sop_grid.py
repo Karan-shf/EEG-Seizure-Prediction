@@ -239,8 +239,10 @@ if __name__ == "__main__":
                 return list(self._data)
             def channels(self):
                 return self._channels
-            def iter_windows(self, patient_id):
+            def iter_windows(self, patient_id, *, only_label=None):
                 for C, lab, _seg in self._data[patient_id]:
+                    if only_label is not None and lab != only_label:
+                        continue
                     yield np.array(C, dtype=float), int(lab)
             def window_meta(self, patient_id):
                 return [_Meta(seg, lab) for _C, lab, seg in self._data[patient_id]]

@@ -337,7 +337,7 @@ SVM_PARAMS: dict = {
 # balancing on synthetic / pre-thinned data would corrupt the anchors' meaning.
 # The held-out patient is NEVER balanced (evaluated on its natural distribution).
 USE_RESAMPLING: bool = True
-UNDERSAMPLE_METHOD: str = "cluster_centroids"
+UNDERSAMPLE_METHOD: str = "random"
 # interictal:preictal ratio AFTER cluster-centroid undersampling (2:1).
 UNDERSAMPLE_INTERICTAL_TO_PREICTAL_RATIO: float = 2.0
 OVERSAMPLE_METHOD: str = "borderline_smote"

@@ -60,8 +60,16 @@ class SpdWindowProvider(Protocol):
     """Streams RAW SPD windows per patient. Must be re-iterable."""
     def patient_ids(self) -> list[str]: ...
     def channels(self) -> tuple[str, ...]: ...
-    def iter_windows(self, patient_id: str) -> Iterator[tuple[np.ndarray, int]]:
-        """Yield (C (n_channels, span_roof, dim, dim) RAW SPD, label in {0,1})."""
+    def iter_windows(self, patient_id: str, *, only_label: int | None = None) -> Iterator[tuple[np.ndarray, int]]:
+        """Yield (C (n_channels, span_roof, dim, dim) RAW SPD, label in {0,1}).
+
+        only_label: if given, yield ONLY windows with this label. Implementations
+        SHOULD check the label BEFORE doing any expensive per-window computation
+        (the RSMMTN/SPD front-end), so a caller that only needs one class (e.g.
+        patient_g's interictal-only pass) never pays for the class it's about
+        to discard. See ChbSpdProvider.iter_windows for the reference
+        implementation of this contract.
+        """
         ...
 
 
@@ -161,11 +169,11 @@ def streaming_log_euclidean_mean(
 # Per-patient fold-invariant artifacts (cached)
 # ---------------------------------------------------------------------------
 def _interictal(provider, pid):
-    return (C for (C, lab) in provider.iter_windows(pid) if lab == 0)
+    return (C for (C, _lab) in provider.iter_windows(pid, only_label=cfg.LABEL_INTERICTAL))
 
 
 def _preictal(provider, pid):
-    return (C for (C, lab) in provider.iter_windows(pid) if lab == 1)
+    return (C for (C, _lab) in provider.iter_windows(pid, only_label=cfg.LABEL_PREICTAL))
 
 
 def patient_g(provider: SpdWindowProvider, pid: str, *, fingerprint=None) -> np.ndarray:
@@ -524,8 +532,10 @@ if __name__ == "__main__":
             return list(self._data.keys())
         def channels(self):
             return self._channels
-        def iter_windows(self, patient_id):
+        def iter_windows(self, patient_id, *, only_label=None):
             for C, lab in self._data[patient_id]:
+                if only_label is not None and lab != only_label:
+                    continue
                 yield np.array(C, dtype=float), int(lab)
 
     data = {}
@@ -533,6 +543,14 @@ if __name__ == "__main__":
         ws = [(spd(), 0) for _ in range(4)] + [(spd(shift=1.0), 1) for _ in range(3)]
         data[p] = ws
     provider = MemProvider(data, channels)
+    # --- only_label filtering: interictal-only / preictal-only streams
+    # partition the full stream exactly, with no overlap or omission ---
+    all_A = list(provider.iter_windows("A"))
+    inter_A = list(provider.iter_windows("A", only_label=cfg.LABEL_INTERICTAL))
+    pre_A = list(provider.iter_windows("A", only_label=cfg.LABEL_PREICTAL))
+    assert len(inter_A) + len(pre_A) == len(all_A)
+    assert all(lab == cfg.LABEL_INTERICTAL for _, lab in inter_A)
+    assert all(lab == cfg.LABEL_PREICTAL for _, lab in pre_A)
 
     # --- streaming Frechet mean == batched backend on a small stack ---
     stack = np.stack([spd() for _ in range(5)])

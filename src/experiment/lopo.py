@@ -95,7 +95,7 @@ class ChbSpdProvider:
                  window_seconds: Optional[float] = None,
                  overlap: Optional[float] = None,
                  apply_notch: bool = False,
-                 signal_cache_size: int = 50,
+                 signal_cache_size: int = 3,
                  operator: Optional[laplacian.LaplacianOperator] = None) -> None:
         if not 0.0 <= float(alpha) <= 1.0:
             raise ValueError(f"alpha must be in [0, 1], got {alpha}")
@@ -178,10 +178,12 @@ class ChbSpdProvider:
         return list(self._plan(patient_id)[2].windows)
 
     # -- the stream --------------------------------------------------------
-    def iter_windows(self, patient_id: str) -> Iterator[Tuple[np.ndarray, int]]:
+    def iter_windows(self, patient_id: str, *, only_label: Optional[int] = None) -> Iterator[Tuple[np.ndarray, int]]:
         _, tl, ws = self._plan(patient_id)
         op = self._op()
         for w in ws.windows:
+            if only_label is not None and w.label != only_label:
+                continue   # skip BEFORE touching the signal or the RSMMTN/SPD front-end
             mf = tl.files_by_name[w.file_name]
             x = self._filtered(patient_id, w.file_name)
             off = w.offset_samples - mf.seg_offset_samples
@@ -440,8 +442,10 @@ if __name__ == "__main__":
             return list(self._data)
         def channels(self):
             return self._channels
-        def iter_windows(self, patient_id):
+        def iter_windows(self, patient_id, *, only_label=None):
             for C, lab, _seg in self._data[patient_id]:
+                if only_label is not None and lab != only_label:
+                    continue
                 yield np.array(C, dtype=float), int(lab)
         def window_meta(self, patient_id):
             return [_Meta(seg, lab) for _C, lab, seg in self._data[patient_id]]
