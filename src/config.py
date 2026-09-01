@@ -218,6 +218,20 @@ ANCHOR_SCOPE: str = "train_fold_only"    # M_interictal / M_preictal: source pat
 # stale cached anchors automatically.
 ANCHOR_MEAN_METHOD: str = "log_euclidean"
 
+# Level-2's "one JBLD call per window across ALL folds" design needs every
+# fold's reference matrices touched by that call -- but JBLD's Cholesky path
+# creates several temporary arrays THE SAME SIZE AS THE INPUT per call
+# (jitter-added copy, Cholesky factor, the P+Q average), so an all-22-folds
+# batch's PEAK transient memory is a large multiple of a single fold's
+# ~40 MiB reference size, not the ~1 GiB a naive "22 x 40 MiB" estimate
+# suggests -- confirmed by a real MemoryError at n_folds=22 that a 2-patient
+# test (n_folds=2) never exposed. Folds are processed in groups of this size
+# per window instead of all-at-once: still gets most of the batching benefit
+# (fewer, larger calls than one-per-fold), bounded peak memory. NOT part of
+# dataset_builder._fingerprint() -- this only changes HOW the (identical)
+# result is computed, never the computed values themselves.
+ALL_FOLD_DISTANCE_BATCH_SIZE: int = 4
+
 def feature_dim(span_roof: int) -> int:
     """Distance-to-reference feature width for a cumulative span roof m.
 

@@ -446,19 +446,31 @@ def build_all_fold_references(provider, patient_ids, *, fingerprint, tag):
                                 fingerprint=fingerprint)
 
 
-def _patient_all_fold_distance_tensor(provider, pid, *, m_int_stack, m_pre_stack, fingerprint):
+def _patient_all_fold_distance_tensor(provider, pid, *, fold_refs, fold_order, fingerprint):
     """Stream one patient's windows ONCE -> distances vs EVERY fold's anchor.
 
-    D : (n_windows, n_folds, n_channels, span, n_references) at full SPAN_MAX.
-    baseline is fold-invariant (read from the cached d_baseline column,
-    broadcast across the fold axis); interictal/preictal are each ONE batched
-    call per window against the STACKED (n_folds, nc, sr, dim, dim) reference
-    arrays -- paying JBLD's per-call overhead once per window, not once per
-    (window, fold) pair.
+    D : (n_windows, n_folds, n_channels, span, n_references), the full
+        SPAN_MAX so any downstream span roof m is a cheap slice.
+
+    Folds are processed in groups of cfg.ALL_FOLD_DISTANCE_BATCH_SIZE, with
+    each batch's small reference stack built ONCE (before the window loop,
+    reused across every window) rather than one all-n_folds stack built
+    once OR rebuilt per window -- bounds JBLD's Cholesky-path peak transient
+    memory to a small multiple of the batch size instead of the full fold
+    count, without redundantly re-stacking the same data on every window.
     """
     g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fingerprint))
     base = patient_baseline_distances(provider, pid, fingerprint=fingerprint)
-    n_folds = m_int_stack.shape[0]
+    n_folds = len(fold_order)
+    batch = max(1, int(cfg.ALL_FOLD_DISTANCE_BATCH_SIZE))
+
+    ref_batches = []
+    for start in range(0, n_folds, batch):
+        end = min(start + batch, n_folds)
+        m_int_b = np.stack([fold_refs[f].get("interictal") for f in fold_order[start:end]])
+        m_pre_b = np.stack([fold_refs[f].get("preictal") for f in fold_order[start:end]])
+        ref_batches.append((start, end, m_int_b, m_pre_b))
+    nc, sr = ref_batches[0][2].shape[1:3] if ref_batches else (0, 0)
 
     rows = []
     idx = 0
@@ -466,15 +478,19 @@ def _patient_all_fold_distance_tensor(provider, pid, *, m_int_stack, m_pre_stack
         cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
         d_base = base.d_baseline[idx]                                  # (nc, sr)
         d_base_b = np.broadcast_to(d_base, (n_folds,) + d_base.shape)  # (nf, nc, sr)
-        d_int = dist.population_distances(cp, m_int_stack)             # (nf, nc, sr)
-        d_pre = dist.population_distances(cp, m_pre_stack)             # (nf, nc, sr)
+
+        d_int = np.empty((n_folds, nc, sr), dtype=float)
+        d_pre = np.empty((n_folds, nc, sr), dtype=float)
+        for start, end, m_int_b, m_pre_b in ref_batches:
+            d_int[start:end] = dist.population_distances(cp, m_int_b)
+            d_pre[start:end] = dist.population_distances(cp, m_pre_b)
+
         rows.append(np.stack([d_base_b, d_int, d_pre], axis=-1))       # (nf, nc, sr, 3)
         idx += 1
 
     if rows:
         D = np.stack(rows)                                             # (nw, nf, nc, sr, 3)
     else:
-        nc, sr = m_int_stack.shape[1:3]
         D = np.zeros((0, n_folds, nc, sr, cfg.N_REFERENCES), dtype=float)
     return D, base.labels.copy()
 
@@ -485,10 +501,8 @@ def patient_all_fold_features(provider, pid, *, fold_refs, fold_order, fingerpri
     -- across the whole LOPO sweep, not once per fold.
     """
     def compute():
-        m_int_stack = np.stack([fold_refs[f].get("interictal") for f in fold_order])
-        m_pre_stack = np.stack([fold_refs[f].get("preictal") for f in fold_order])
         D, y = _patient_all_fold_distance_tensor(
-            provider, pid, m_int_stack=m_int_stack, m_pre_stack=m_pre_stack,
+            provider, pid, fold_refs=fold_refs, fold_order=fold_order,
             fingerprint=fingerprint)
         return {"D": D, "y": y}
 
