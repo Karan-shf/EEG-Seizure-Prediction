@@ -182,6 +182,17 @@ def _level2_job(args) -> JobResult:
 def _run_pool(job_fn, job_args: List[tuple], *, n_workers: Optional[int] = None) -> List[JobResult]:
     n = n_workers if n_workers is not None else resolve_n_workers()
     log.info("parallel pool: %d job(s) across %d worker(s)", len(job_args), n)
+
+    # Pin BLAS threads HERE, in the PARENT, before any child is spawned --
+    # not just inside _worker_init. Spawned children inherit the parent's
+    # OS-level environment at creation time, so this guarantees every
+    # worker sees the pinned values from its very first bootstrap step,
+    # before anything in that child (including run.py's own import chain
+    # re-executing under spawn) can import numpy and lock in BLAS's thread
+    # count first. _worker_init's own call is kept too, as a second layer
+    # for any code path that creates a Pool without going through here.
+    pin_blas_threads(1)
+
     ctx = get_context("spawn")   # explicit: the correct default on Windows,
                                   # and explicit beats relying on whatever a
                                   # different OS's platform default happens
