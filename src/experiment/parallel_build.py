@@ -127,8 +127,16 @@ def _level2_job(args) -> JobResult:
     therefore expected to be a cache HIT (a disk read), never a recompute,
     regardless of which single patient this worker's own provider knows
     about (ChbSpdProvider resolves any patient id by path directly; it does
-    not gate iter_windows on what was passed to its constructor)."""
-    patient_id, alpha, raw_dir, sop_minutes, span_roof, fingerprint, tag, patient_ids = args
+    not gate iter_windows on what was passed to its constructor).
+
+    NOTE: no span_roof here on purpose. patient_all_fold_features always
+    caches the distance tensor at the FULL SPAN_MAX -- span roof is a cheap
+    slice applied later, per fold, in dataset_builder.build_fold_precomputed.
+    An earlier draft threaded a span_roof argument through to this job
+    without ever using it; removed rather than left dead, since an unused
+    parameter here would wrongly imply span_roof affects what gets cached
+    at this stage."""
+    patient_id, alpha, raw_dir, sop_minutes, fingerprint, tag, patient_ids = args
     t0 = time.perf_counter()
     try:
         from src.experiment.lopo import ChbSpdProvider
@@ -190,7 +198,6 @@ def run_level1_parallel(patients: Sequence[str], *, alpha: float,
 
 
 def run_level2_parallel(patients: Sequence[str], *, alpha: float,
-                        span_roof: Optional[int] = None,
                         raw_dir: Optional[Path] = None,
                         sop_minutes: Optional[int] = None,
                         n_workers: Optional[int] = None) -> List[JobResult]:
@@ -198,6 +205,11 @@ def run_level2_parallel(patients: Sequence[str], *, alpha: float,
     cheap), THEN stream every patient's windows exactly once against all of
     them, in parallel. Requires level-1 already complete for every patient
     (call run_level1_parallel first, or use run_precompute_parallel).
+
+    No span_roof parameter: patient_all_fold_features always caches the
+    distance tensor at the full SPAN_MAX. Any span roof is a cheap slice
+    applied later, per fold, in dataset_builder.build_fold_precomputed --
+    that is exactly what makes the span-roof sweep free after this runs.
     """
     from src.experiment.lopo import ChbSpdProvider, _alpha_fingerprint
     from src.data import dataset_builder as db
@@ -215,7 +227,7 @@ def run_level2_parallel(patients: Sequence[str], *, alpha: float,
     db.build_all_fold_references(provider, ids, fingerprint=fp, tag=tag)
     log.info("level-2: fold references ready in %.1fs", time.perf_counter() - t0)
 
-    job_args = [(p, alpha, raw_dir, sop_minutes, span_roof, fp, tag, ids) for p in ids]
+    job_args = [(p, alpha, raw_dir, sop_minutes, fp, tag, ids) for p in ids]
 
     t1 = time.perf_counter()
     results = _run_pool(_level2_job, job_args, n_workers=n_workers)
@@ -231,7 +243,6 @@ def run_level2_parallel(patients: Sequence[str], *, alpha: float,
 
 
 def run_precompute_parallel(patients: Sequence[str], *, alpha: float,
-                            span_roof: Optional[int] = None,
                             raw_dir: Optional[Path] = None,
                             sop_minutes: Optional[int] = None,
                             n_workers: Optional[int] = None) -> Dict[str, List[JobResult]]:
@@ -245,7 +256,7 @@ def run_precompute_parallel(patients: Sequence[str], *, alpha: float,
             "level-1 had failures; refusing to start level-2 (its fold "
             "references need EVERY patient's level-1 result). See the "
             "logged errors above.")
-    l2 = run_level2_parallel(patients, alpha=alpha, span_roof=span_roof,
+    l2 = run_level2_parallel(patients, alpha=alpha,
                              raw_dir=raw_dir, sop_minutes=sop_minutes,
                              n_workers=n_workers)
     return {"level1": l1, "level2": l2}

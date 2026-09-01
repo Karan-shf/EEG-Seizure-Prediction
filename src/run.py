@@ -49,6 +49,7 @@ from src.utils.logger import get_logger
 from src.experiment import inventory as inventory_mod
 from src.experiment import lopo as lopo_mod
 from src.experiment import sop_grid as grid_mod
+from src.experiment import parallel_build
 
 log = get_logger("src.run")
 
@@ -130,6 +131,29 @@ def _resolve_eligible(args: argparse.Namespace) -> Optional[List[str]]:
         raise SystemExit("no eligible patients -- nothing to run")
     log.info("eligibility gate: %d/%d patients eligible", len(eligible), len(items))
     return eligible
+
+
+def _run_precompute(args: argparse.Namespace) -> int:
+    patients = _resolve_eligible(args) if args.eligible_only else _expand_patients(args.patients)
+    pats = patients if patients else list(lopo_mod.DEFAULT_PATIENTS)
+    alphas = tuple(cfg.SWEEP_ALPHA if args.alphas is None else args.alphas)
+    print(f"precompute: {len(pats)} patient(s) x {len(alphas)} alpha(s) "
+          f"{list(alphas)}, workers={args.n_workers or '(auto)'}")
+    for a in alphas:
+        print(f"\n=== precompute alpha={a:.2f} ===")
+        out = parallel_build.run_precompute_parallel(
+            pats, alpha=a, raw_dir=args.raw_dir, sop_minutes=args.sop,
+            n_workers=args.n_workers)
+        n1_ok = sum(r.ok for r in out["level1"])
+        n2_ok = sum(r.ok for r in out["level2"])
+        print(f"  level-1: {n1_ok}/{len(out['level1'])} OK   "
+              f"level-2: {n2_ok}/{len(out['level2'])} OK")
+        if n1_ok < len(out["level1"]) or n2_ok < len(out["level2"]):
+            log.error("precompute alpha=%.2f: incomplete -- see logged errors above", a)
+            return 1
+    print("\nprecompute complete. Run e.g.:")
+    print("  python3 -m src.run grid --mode precomputed --eligible-only --probe")
+    return 0
 
 
 def _print_lopo(res) -> None:
@@ -289,6 +313,25 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="probe EDF headers to size no-clock patients (chb24)")
     inv.add_argument("--min-lead", type=int, default=inventory_mod.MIN_LEAD_SEIZURES)
 
+    pre = sub.add_parser("precompute",
+                         help="Tier-2: parallel level-1 + level-2 cache build "
+                              "(run BEFORE lopo/grid --mode precomputed)")
+    pre.add_argument("--patients", nargs="+", metavar="ID",
+                     help="patient ids and/or ranges; default: all")
+    pre.add_argument("--raw-dir", type=Path, default=None)
+    pre.add_argument("--sop", type=int, default=None)
+    pre.add_argument("--alphas", nargs="+", type=float, default=None,
+                     help=f"default: {list(cfg.SWEEP_ALPHA)}")
+    pre.add_argument("--n-workers", type=int, default=None, dest="n_workers",
+                     help="override src.utils.parallel.resolve_n_workers()'s "
+                          "auto-detected worker count")
+    pre.add_argument("--eligible-only", action="store_true",
+                     help="run inventory first and keep only eligible patients")
+    pre.add_argument("--probe", action="store_true",
+                     help="probe EDF headers to size no-clock patients (chb24)")
+    pre.add_argument("--min-lead", type=int, default=inventory_mod.MIN_LEAD_SEIZURES,
+                     help="min lead seizures for eligibility")
+
     lo = sub.add_parser("lopo", help="single (alpha, span_roof) LOPO run")
     lo.add_argument("--alpha", type=float, required=True)
     lo.add_argument("--span-roof", type=int, default=None, dest="span_roof")
@@ -322,6 +365,7 @@ def _build_parser() -> argparse.ArgumentParser:
 _DISPATCH = {
     "config": _run_config,
     "inventory": _run_inventory,
+    "precompute": _run_precompute,
     "lopo": _run_lopo,
     "grid": _run_grid,
     "all": _run_all,
@@ -371,7 +415,8 @@ def _selftest() -> int:
 
     # --- dispatch wiring: patch the drivers so nothing heavy runs ---
     calls = {}
-    orig = (grid_mod.run_grid, lopo_mod.run_lopo, inventory_mod.build_inventory)
+    orig = (grid_mod.run_grid, lopo_mod.run_lopo, inventory_mod.build_inventory,
+            parallel_build.run_precompute_parallel)
     try:
         def fake_grid(**kw):
             calls["grid"] = kw
@@ -396,9 +441,15 @@ def _selftest() -> int:
             calls["inv"] = {"patients": patients, **kw}
             return items  # chb01 + chb03 eligible
 
+        def fake_precompute(patients, *, alpha, **kw):
+            calls.setdefault("precompute_alphas", []).append(alpha)
+            calls["precompute_patients"] = patients
+            return {"level1": [], "level2": []}
+
         grid_mod.run_grid = fake_grid
         lopo_mod.run_lopo = fake_lopo
         inventory_mod.build_inventory = fake_inv
+        parallel_build.run_precompute_parallel = fake_precompute
 
         # grid, explicit patients, no eligibility gate
         assert main(["grid", "--alphas", "0.5", "--span-roofs", "3",
@@ -417,10 +468,17 @@ def _selftest() -> int:
         assert main(["all", "--alphas", "1.0", "--span-roofs", "9", "--no-save"]) == 0
         assert calls["grid"]["patients"] == ["chb01", "chb03"]
 
+        # precompute: loops run_precompute_parallel once per alpha
+        assert main(["precompute", "--alphas", "0.5", "1.0",
+                     "--patients", "chb01..chb02"]) == 0
+        assert calls["precompute_alphas"] == [0.5, 1.0]
+        assert calls["precompute_patients"] == ["chb01", "chb02"]
+
         # config prints without touching the drivers
         assert main(["config"]) == 0
     finally:
-        grid_mod.run_grid, lopo_mod.run_lopo, inventory_mod.build_inventory = orig
+        (grid_mod.run_grid, lopo_mod.run_lopo, inventory_mod.build_inventory,
+         parallel_build.run_precompute_parallel) = orig
 
     print("\nOK - run.py self-test passed.")
     return 0
