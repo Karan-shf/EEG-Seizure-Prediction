@@ -13,6 +13,7 @@ runs this project involves.
 
 from __future__ import annotations
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -85,7 +86,11 @@ def get_logger(
         if filename is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             safe_name = name.replace(".", "_")
-            filename = f"{safe_name}_{stamp}.log"
+            # PID included so concurrent processes (Tier-2 multiprocessing)
+            # NEVER collide on the same log filename, even if two workers
+            # spawn within the same second -- a real risk under
+            # multiprocessing that a timestamp alone doesn't rule out.
+            filename = f"{safe_name}_{stamp}_p{os.getpid()}.log"
         file_path = log_dir / filename
         file_handler = logging.FileHandler(file_path, encoding="utf-8")
         file_handler.setLevel(level)

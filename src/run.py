@@ -260,6 +260,34 @@ def _run_grid(args: argparse.Namespace) -> int:
 def _run_all(args: argparse.Namespace) -> int:
     # Force the eligibility gate on, then run the full sweep over survivors.
     args.eligible_only = True
+
+    if args.mode == "precomputed":
+        # Resolve eligible patients ONCE and reuse the same list for both
+        # precompute and the grid, instead of running inventory twice.
+        patients = _resolve_eligible(args)
+        pats = patients if patients else list(lopo_mod.DEFAULT_PATIENTS)
+        alphas = tuple(cfg.SWEEP_ALPHA if args.alphas is None else args.alphas)
+
+        print(f"all (precomputed mode): building cache for {len(pats)} patient(s) "
+              f"x {len(alphas)} alpha(s) {list(alphas)} first...")
+        for a in alphas:
+            print(f"\n=== precompute alpha={a:.2f} ===")
+            out = parallel_build.run_precompute_parallel(
+                pats, alpha=a, raw_dir=args.raw_dir, sop_minutes=args.sop,
+                n_workers=args.n_workers)
+            n1_ok = sum(r.ok for r in out["level1"])
+            n2_ok = sum(r.ok for r in out["level2"])
+            print(f"  level-1: {n1_ok}/{len(out['level1'])} OK   "
+                  f"level-2: {n2_ok}/{len(out['level2'])} OK")
+            if n1_ok < len(out["level1"]) or n2_ok < len(out["level2"]):
+                log.error("precompute alpha=%.2f: incomplete -- see logged errors above", a)
+                return 1
+
+        # Hand the grid the SAME already-resolved list; skip re-running inventory.
+        args.patients = pats
+        args.eligible_only = False
+        print("\nprecompute complete -> running grid from cache...\n")
+
     return _run_grid(args)
 
 
@@ -356,6 +384,9 @@ def _build_parser() -> argparse.ArgumentParser:
     al.add_argument("--tag", default=None)
     al.add_argument("--results-dir", type=Path, default=None, dest="results_dir")
     al.add_argument("--no-save", action="store_true")
+    al.add_argument("--n-workers", type=int, default=None, dest="n_workers",
+                    help="override src.utils.parallel.resolve_n_workers()'s "
+                         "auto-detected worker count (only used with --mode precomputed)")
     _add_common(al, with_eligible=True)
 
     sub.add_parser("selftest", help="dependency-light plumbing self-test")
@@ -463,10 +494,21 @@ def _selftest() -> int:
         assert calls["lopo"]["alpha"] == 0.5
         assert calls["lopo"]["patients"] == ["chb01", "chb03"]
 
-        # all -> forces eligibility gate, drives the grid over survivors
+        # all (default mode) -> forces eligibility gate, drives the grid over survivors
         calls.pop("grid", None)
         assert main(["all", "--alphas", "1.0", "--span-roofs", "9", "--no-save"]) == 0
         assert calls["grid"]["patients"] == ["chb01", "chb03"]
+
+        # all --mode precomputed -> precompute runs first (once per alpha),
+        # then grid reuses the SAME already-resolved patient list
+        calls.pop("grid", None)
+        calls.pop("precompute_alphas", None)
+        assert main(["all", "--alphas", "0.5", "1.0", "--span-roofs", "5",
+                     "--mode", "precomputed", "--no-save"]) == 0
+        assert calls["precompute_alphas"] == [0.5, 1.0]
+        assert calls["precompute_patients"] == ["chb01", "chb03"]
+        assert calls["grid"]["patients"] == ["chb01", "chb03"]
+        assert calls["grid"]["mode"] == "precomputed"
 
         # precompute: loops run_precompute_parallel once per alpha
         assert main(["precompute", "--alphas", "0.5", "1.0",

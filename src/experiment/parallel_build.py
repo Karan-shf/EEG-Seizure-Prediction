@@ -68,6 +68,7 @@ through in conversation before this was written):
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from multiprocessing import get_context
@@ -100,9 +101,19 @@ def _worker_init() -> None:
 
 def _level1_job(args) -> JobResult:
     """One patient's level-1 anchor build (g_patient + the merged d_baseline
-    / patient_anchor_means pass). Runs inside a worker process."""
+    / patient_anchor_means pass). Runs inside a worker process.
+
+    Explicit PID-tagged START/END log lines exist because, with only END
+    times, "started together and finished at naturally different times
+    because patients are different sizes" and "ran strictly one after
+    another" are IMPOSSIBLE to tell apart from the outside. Don't eyeball
+    that distinction from completion timestamps alone -- check these START
+    lines (or Task Manager's process list) if parallelism is ever in doubt.
+    """
     patient_id, alpha, raw_dir, sop_minutes, fingerprint = args
+    pid = os.getpid()
     t0 = time.perf_counter()
+    log.info("level1 START patient=%s pid=%d", patient_id, pid)
     try:
         # Deferred imports: guarantees _worker_init's env-var pinning ran
         # before numpy is first imported in THIS process.
@@ -113,10 +124,15 @@ def _level1_job(args) -> JobResult:
                                   sop_minutes=sop_minutes)
         db.patient_g(provider, patient_id, fingerprint=fingerprint)
         baseline, _means = db._pass2_artifacts(provider, patient_id, fingerprint=fingerprint)
-        return JobResult(patient_id, True, time.perf_counter() - t0,
-                         n_windows=len(baseline.labels))
+        elapsed = time.perf_counter() - t0
+        log.info("level1 END   patient=%s pid=%d elapsed=%.1fs windows=%d",
+                 patient_id, pid, elapsed, len(baseline.labels))
+        return JobResult(patient_id, True, elapsed, n_windows=len(baseline.labels))
     except Exception as exc:  # noqa: BLE001 -- report, don't crash the pool
-        return JobResult(patient_id, False, time.perf_counter() - t0, error=repr(exc))
+        elapsed = time.perf_counter() - t0
+        log.error("level1 FAILED patient=%s pid=%d elapsed=%.1fs error=%r",
+                  patient_id, pid, elapsed, exc)
+        return JobResult(patient_id, False, elapsed, error=repr(exc))
 
 
 def _level2_job(args) -> JobResult:
@@ -137,7 +153,9 @@ def _level2_job(args) -> JobResult:
     parameter here would wrongly imply span_roof affects what gets cached
     at this stage."""
     patient_id, alpha, raw_dir, sop_minutes, fingerprint, tag, patient_ids = args
+    pid = os.getpid()
     t0 = time.perf_counter()
+    log.info("level2 START patient=%s pid=%d", patient_id, pid)
     try:
         from src.experiment.lopo import ChbSpdProvider
         from src.data import dataset_builder as db
@@ -150,10 +168,15 @@ def _level2_job(args) -> JobResult:
         feats = db.patient_all_fold_features(provider, patient_id, fold_refs=fold_refs,
                                              fold_order=fold_order,
                                              fingerprint=fingerprint, tag=tag)
-        return JobResult(patient_id, True, time.perf_counter() - t0,
-                         n_windows=len(feats["y"]))
+        elapsed = time.perf_counter() - t0
+        log.info("level2 END   patient=%s pid=%d elapsed=%.1fs windows=%d",
+                 patient_id, pid, elapsed, len(feats["y"]))
+        return JobResult(patient_id, True, elapsed, n_windows=len(feats["y"]))
     except Exception as exc:  # noqa: BLE001
-        return JobResult(patient_id, False, time.perf_counter() - t0, error=repr(exc))
+        elapsed = time.perf_counter() - t0
+        log.error("level2 FAILED patient=%s pid=%d elapsed=%.1fs error=%r",
+                  patient_id, pid, elapsed, exc)
+        return JobResult(patient_id, False, elapsed, error=repr(exc))
 
 
 def _run_pool(job_fn, job_args: List[tuple], *, n_workers: Optional[int] = None) -> List[JobResult]:
