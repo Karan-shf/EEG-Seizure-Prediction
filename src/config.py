@@ -218,6 +218,32 @@ ANCHOR_SCOPE: str = "train_fold_only"    # M_interictal / M_preictal: source pat
 # stale cached anchors automatically.
 ANCHOR_MEAN_METHOD: str = "log_euclidean"
 
+# Level-2 needs every fold's reference matrices compared against every
+# window. Doing this as ONE call across all N folds at once means every
+# JBLD/Cholesky call internally allocates several arrays THE SIZE OF THE
+# FULL N-FOLD REFERENCE STACK (the P+Q average, the jitter-added copy, the
+# Cholesky factor) -- at n_folds=22 that's several GB of TRANSIENT churn
+# PER WINDOW, on top of an ~2.9 GiB STANDING footprint per worker just to
+# hold all 22 folds' references resident. Confirmed directly: a 16 GB
+# machine showed 31 GB "Committed" memory and severe page-file thrashing
+# (30-50x slowdown) under this design, even without an outright crash.
+#
+# Folds are processed in GROUPS of this size instead: for each group, the
+# patient's windows are streamed once (recomputing rsmmtn+spd+recenter),
+# scored against just that group, then the group is discarded before the
+# next one loads. This bounds BOTH the standing AND the transient cost to
+# roughly (batch_size / n_folds) of the unbounded design, at the cost of
+# ceil(n_folds / batch_size) re-streaming passes instead of 1:
+#   SMALLER batch -> less memory (standing AND transient), MORE passes
+#   LARGER batch  -> more memory, FEWER passes (batch_size >= n_folds is
+#                    exactly the original single-pass, unbounded design)
+# 8 is a moderate default: at n_folds=22, that's 3 passes (not 22, not 1)
+# and roughly a third of the unbounded design's memory footprint. Tune
+# based on observed "Committed" memory vs your physical RAM, not blindly.
+# NOT part of dataset_builder._fingerprint() -- this only changes HOW the
+# (identical) result is computed, never the computed values themselves.
+ALL_FOLD_DISTANCE_BATCH_SIZE: int = 8
+
 # Level-2's "one JBLD call per window across ALL folds" design needs every
 # fold's reference matrices touched by that call -- but JBLD's Cholesky path
 # creates several temporary arrays THE SAME SIZE AS THE INPUT per call

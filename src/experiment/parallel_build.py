@@ -148,10 +148,12 @@ def _level2_job(args) -> JobResult:
     NOTE: no span_roof here on purpose. patient_all_fold_features always
     caches the distance tensor at the FULL SPAN_MAX -- span roof is a cheap
     slice applied later, per fold, in dataset_builder.build_fold_precomputed.
-    An earlier draft threaded a span_roof argument through to this job
-    without ever using it; removed rather than left dead, since an unused
-    parameter here would wrongly imply span_roof affects what gets cached
-    at this stage."""
+
+    Also no longer calls build_all_fold_references itself: that already ran
+    (per-fold, one at a time) in the main process before this pool spawned
+    (see run_level2_parallel), so every fold reference this worker needs is
+    already an individual, cheap cache hit -- loaded lazily, group-at-a-time,
+    inside patient_all_fold_features -> _patient_all_fold_distance_tensor."""
     patient_id, alpha, raw_dir, sop_minutes, fingerprint, tag, patient_ids = args
     pid = os.getpid()
     t0 = time.perf_counter()
@@ -162,11 +164,8 @@ def _level2_job(args) -> JobResult:
 
         provider = ChbSpdProvider([patient_id], alpha=alpha, raw_dir=raw_dir,
                                   sop_minutes=sop_minutes)
-        fold_refs = db.build_all_fold_references(provider, patient_ids,
-                                                  fingerprint=fingerprint, tag=tag)
         fold_order = tuple(patient_ids)
-        feats = db.patient_all_fold_features(provider, patient_id, fold_refs=fold_refs,
-                                             fold_order=fold_order,
+        feats = db.patient_all_fold_features(provider, patient_id, fold_order=fold_order,
                                              fingerprint=fingerprint, tag=tag)
         elapsed = time.perf_counter() - t0
         log.info("level2 END   patient=%s pid=%d elapsed=%.1fs windows=%d",

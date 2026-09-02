@@ -424,86 +424,94 @@ def patient_loo_features(provider, test_patient, *, references, fingerprint, tag
 # exact mode -- it just changes the ORDER work happens in (build every anchor
 # first, since that's cheap; then never re-stream a patient).
 # ---------------------------------------------------------------------------
-def build_all_fold_references(provider, patient_ids, *, fingerprint, tag):
-    """One TRUE leave-one-out ReferenceSet per possible test_patient, built
-    from already-cached level-1 patient_anchor_means. Cheap -- only averages
-    small already-built matrices, no raw windows touched. Cached as one blob
-    per (cohort, alpha) via `tag` (reuses fast mode's cohort+alpha tagging).
-    """
+def build_one_fold_reference(provider, patient_ids, test_patient, *, fingerprint, tag):
+    """ONE fold's true leave-one-out ReferenceSet, cached under its OWN key
+    -- not bundled with the other N-1 folds. Bundling forces every consumer
+    to load ALL of them into memory just to use one."""
     ids = list(patient_ids)
+    key = f"{tag}_{test_patient}"
 
     def compute():
-        pms = {p: patient_anchor_means(provider, p, fingerprint=fingerprint) for p in ids}
-        out = {}
-        for test_patient in ids:
-            source = [p for p in ids if p != test_patient]
-            out[test_patient] = refs.build_fold_references(
-                [pms[p] for p in source], channels=tuple(provider.channels()),
-                source_patient_ids=source)
-        return out
+        source = [p for p in ids if p != test_patient]
+        pms = [patient_anchor_means(provider, p, fingerprint=fingerprint) for p in source]
+        return refs.build_fold_references(
+            pms, channels=tuple(provider.channels()), source_patient_ids=source)
 
-    return cache.get_or_compute("all_fold_references", f"refs_{tag}", compute,
-                                fingerprint=fingerprint)
+    return cache.get_or_compute("all_fold_references", key, compute, fingerprint=fingerprint)
 
 
-def _patient_all_fold_distance_tensor(provider, pid, *, fold_refs, fold_order, fingerprint):
-    """Stream one patient's windows ONCE -> distances vs EVERY fold's anchor.
+def build_all_fold_references(provider, patient_ids, *, fingerprint, tag):
+    """Build + cache EVERY fold's reference set, ONE AT A TIME -- each
+    fold's ~80 MiB is computed, cached to its own disk entry, and discarded
+    before the next one is built. Never holds more than one fold's reference
+    data in memory at once, regardless of cohort size. Call ONCE, in the
+    main process, before any worker pool starts (see run_level2_parallel) so
+    every worker gets cache HITS, never a race. Returns nothing large;
+    callers load individual folds via build_one_fold_reference as needed.
+    """
+    ids = list(patient_ids)
+    for test_patient in ids:
+        build_one_fold_reference(provider, ids, test_patient,
+                                 fingerprint=fingerprint, tag=tag)
+    log.info("build_all_fold_references: %d fold reference set(s) cached "
+             "individually (tag=%s)", len(ids), tag)
 
-    D : (n_windows, n_folds, n_channels, span, n_references), the full
-        SPAN_MAX so any downstream span roof m is a cheap slice.
 
-    Folds are processed in groups of cfg.ALL_FOLD_DISTANCE_BATCH_SIZE, with
-    each batch's small reference stack built ONCE (before the window loop,
-    reused across every window) rather than one all-n_folds stack built
-    once OR rebuilt per window -- bounds JBLD's Cholesky-path peak transient
-    memory to a small multiple of the batch size instead of the full fold
-    count, without redundantly re-stacking the same data on every window.
+def _patient_all_fold_distance_tensor(provider, pid, *, fold_order, fingerprint, tag):
+    """Distances for one patient vs EVERY fold's anchor, processed in GROUPS
+    of cfg.ALL_FOLD_DISTANCE_BATCH_SIZE folds. For EACH group: load just
+    that group's fold references (cache hit, cheap disk read), stream this
+    patient's windows ONCE against just that group, discard the group, move
+    on. batch_size >= n_folds collapses this to exactly one pass total.
+
+    D : (n_windows, n_folds, n_channels, span, n_references) at the full
+        SPAN_MAX, in fold_order order.
     """
     g_invsqrt = bk.spd_invsqrt(patient_g(provider, pid, fingerprint=fingerprint))
     base = patient_baseline_distances(provider, pid, fingerprint=fingerprint)
+    n_windows = len(base.labels)
     n_folds = len(fold_order)
     batch = max(1, int(cfg.ALL_FOLD_DISTANCE_BATCH_SIZE))
 
-    ref_batches = []
+    D = None  # allocated once nc/sr are known, from the first group
     for start in range(0, n_folds, batch):
         end = min(start + batch, n_folds)
-        m_int_b = np.stack([fold_refs[f].get("interictal") for f in fold_order[start:end]])
-        m_pre_b = np.stack([fold_refs[f].get("preictal") for f in fold_order[start:end]])
-        ref_batches.append((start, end, m_int_b, m_pre_b))
-    nc, sr = ref_batches[0][2].shape[1:3] if ref_batches else (0, 0)
+        group = fold_order[start:end]
+        m_int_b = np.stack([
+            build_one_fold_reference(provider, fold_order, f,
+                                     fingerprint=fingerprint, tag=tag).get("interictal")
+            for f in group])
+        m_pre_b = np.stack([
+            build_one_fold_reference(provider, fold_order, f,
+                                     fingerprint=fingerprint, tag=tag).get("preictal")
+            for f in group])
+        nc, sr = m_int_b.shape[1:3]
+        if D is None:
+            D = np.zeros((n_windows, n_folds, nc, sr, cfg.N_REFERENCES), dtype=float)
 
-    rows = []
-    idx = 0
-    for (C, _lab) in provider.iter_windows(pid):
-        cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
-        d_base = base.d_baseline[idx]                                  # (nc, sr)
-        d_base_b = np.broadcast_to(d_base, (n_folds,) + d_base.shape)  # (nf, nc, sr)
+        idx = 0
+        for (C, _lab) in provider.iter_windows(pid):
+            cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+            d_base = base.d_baseline[idx]                                    # (nc, sr)
+            D[idx, start:end, :, :, 0] = np.broadcast_to(d_base, (end - start,) + d_base.shape)
+            D[idx, start:end, :, :, 1] = dist.population_distances(cp, m_int_b)
+            D[idx, start:end, :, :, 2] = dist.population_distances(cp, m_pre_b)
+            idx += 1
+        del m_int_b, m_pre_b  # explicit: this group's data must not outlive its own pass
 
-        d_int = np.empty((n_folds, nc, sr), dtype=float)
-        d_pre = np.empty((n_folds, nc, sr), dtype=float)
-        for start, end, m_int_b, m_pre_b in ref_batches:
-            d_int[start:end] = dist.population_distances(cp, m_int_b)
-            d_pre[start:end] = dist.population_distances(cp, m_pre_b)
-
-        rows.append(np.stack([d_base_b, d_int, d_pre], axis=-1))       # (nf, nc, sr, 3)
-        idx += 1
-
-    if rows:
-        D = np.stack(rows)                                             # (nw, nf, nc, sr, 3)
-    else:
-        D = np.zeros((0, n_folds, nc, sr, cfg.N_REFERENCES), dtype=float)
+    if D is None:
+        D = np.zeros((n_windows, 0, 0, 0, cfg.N_REFERENCES), dtype=float)
     return D, base.labels.copy()
 
 
-def patient_all_fold_features(provider, pid, *, fold_refs, fold_order, fingerprint, tag):
+def patient_all_fold_features(provider, pid, *, fold_order, fingerprint, tag):
     """Per-window distance tensor for `pid` vs ALL folds' true LOO anchors,
-    cached per (patient, cohort, alpha). `pid` is streamed at most once, EVER
-    -- across the whole LOPO sweep, not once per fold.
+    cached per (patient, cohort, alpha). `pid` is streamed
+    ceil(n_folds / cfg.ALL_FOLD_DISTANCE_BATCH_SIZE) times total.
     """
     def compute():
         D, y = _patient_all_fold_distance_tensor(
-            provider, pid, fold_refs=fold_refs, fold_order=fold_order,
-            fingerprint=fingerprint)
+            provider, pid, fold_order=fold_order, fingerprint=fingerprint, tag=tag)
         return {"D": D, "y": y}
 
     return cache.get_or_compute("all_fold_features", f"{pid}_{tag}", compute,
@@ -530,13 +538,13 @@ def build_fold_precomputed(provider, test_patient, *, span_roof: int | None = No
     tag = _fast_tag(ids, alpha)
     fold_order = tuple(ids)
 
-    fold_refs = build_all_fold_references(provider, ids, fingerprint=fp, tag=tag)
+    build_all_fold_references(provider, ids, fingerprint=fp, tag=tag)  # side effect: per-fold cache populated
 
     Xtr, ytr, gtr = [], [], []
     Xte, yte = None, None
     for p in ids:
-        feats = patient_all_fold_features(provider, p, fold_refs=fold_refs,
-                                          fold_order=fold_order, fingerprint=fp, tag=tag)
+        feats = patient_all_fold_features(provider, p, fold_order=fold_order,
+                                          fingerprint=fp, tag=tag)
         f_idx = fold_order.index(test_patient)
         D_f = feats["D"][:, f_idx]                       # (nw_p, nc, sr, n_refs)
         X_p = _slice_features(D_f, span_roof)
@@ -786,18 +794,28 @@ if __name__ == "__main__":
     # Unlike fast mode, this must match EXACT mode bit-for-bit on BOTH
     # train and test -- it's only a caching/streaming-order change, not an
     # approximation.
-    fold_pre_A = build_fold_precomputed(provider, "A", span_roof=sr, alpha=0.5)
-    assert fold_pre_A.X_test.shape == fold_exact.X_test.shape
-    assert np.allclose(fold_pre_A.X_test, fold_exact.X_test, atol=1e-9)
-    assert fold_pre_A.X_train.shape == fold_exact.X_train.shape
-    assert np.allclose(fold_pre_A.X_train, fold_exact.X_train, atol=1e-9), \
-        "precomputed mode must match exact mode's TRAIN features too (fast mode does not)"
-    assert np.array_equal(fold_pre_A.y_test, fold_exact.y_test)
+    # Correctness must NOT depend on ALL_FOLD_DISTANCE_BATCH_SIZE -- prove it
+    # with an extreme small batch (forces several re-streaming passes) AND a
+    # large one (collapses to one pass); both must match exact mode exactly.
+    prev_batch = cfg.ALL_FOLD_DISTANCE_BATCH_SIZE
+    try:
+        for test_batch_size in (1, 100):
+            cfg.ALL_FOLD_DISTANCE_BATCH_SIZE = test_batch_size
+            cache.clear("all_fold_features")  # same cache key, different
+                                              # batch size -- force recompute
+            fold_pre_A = build_fold_precomputed(provider, "A", span_roof=sr, alpha=0.5)
+            assert fold_pre_A.X_test.shape == fold_exact.X_test.shape
+            assert np.allclose(fold_pre_A.X_test, fold_exact.X_test, atol=1e-9), test_batch_size
+            assert fold_pre_A.X_train.shape == fold_exact.X_train.shape
+            assert np.allclose(fold_pre_A.X_train, fold_exact.X_train, atol=1e-9), test_batch_size
+            assert np.array_equal(fold_pre_A.y_test, fold_exact.y_test)
+    finally:
+        cfg.ALL_FOLD_DISTANCE_BATCH_SIZE = prev_batch
 
     folds_pre = build_lopo_precomputed(provider, span_roof=sr, alpha=0.5)
     assert len(folds_pre) == len(provider.patient_ids())
     assert {f.test_patient for f in folds_pre} == set(provider.patient_ids())
-    assert cache.has("all_fold_references", f"refs_{tag05}", fingerprint=fp)
+    assert cache.has("all_fold_references", f"{tag05}_A", fingerprint=fp)
     assert cache.has("all_fold_features", f"B_{tag05}", fingerprint=fp)
 
     import shutil
