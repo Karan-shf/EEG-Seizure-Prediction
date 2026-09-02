@@ -31,6 +31,7 @@ import os
 import pickle
 import shutil
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -39,8 +40,22 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# In-run memoization (only consulted when caching is enabled).
-_MEM: dict[tuple[str, str], Any] = {}
+# In-run memoization (only consulted when caching is enabled). Bounded LRU:
+# every entry also has (or will have) a durable copy on disk for
+# fold-invariant kinds, so eviction is never a correctness risk -- it just
+# means the next access re-reads from disk. See cfg.CACHE_MEM_MAX_ENTRIES.
+_MEM: OrderedDict[tuple[str, str], Any] = OrderedDict()
+
+
+def _mem_set(mk: tuple[str, str], value: Any) -> None:
+    """Insert/update an entry and mark it most-recently-used, evicting the
+    least-recently-used entry if this pushes _MEM over its configured cap."""
+    _MEM[mk] = value
+    _MEM.move_to_end(mk)
+    max_entries = int(getattr(cfg, "CACHE_MEM_MAX_ENTRIES", 40))
+    while len(_MEM) > max_entries:
+        evicted_mk, _ = _MEM.popitem(last=False)
+        log.debug("cache: _MEM evicted %s (LRU, cap=%d)", evicted_mk, max_entries)
 
 
 def cache_dir() -> Path:
@@ -78,6 +93,7 @@ def has(kind: str, key: str, *, fingerprint: Optional[str] = None) -> bool:
         return False
     mk = _mk(kind, key)
     if mk in _MEM:
+        _MEM.move_to_end(mk)  # touched -> most-recently-used
         return fingerprint is None or _MEM[mk][0] == fingerprint
     data_p, meta_p = _paths(kind, key)
     if not data_p.exists():
@@ -99,6 +115,7 @@ def load(kind: str, key: str, *, fingerprint: Optional[str] = None,
     mk = _mk(kind, key)
     if mk in _MEM:
         fp_stored, obj = _MEM[mk]
+        _MEM.move_to_end(mk)  # touched -> most-recently-used
         return obj if (fingerprint is None or fp_stored == fingerprint) else default
     data_p, meta_p = _paths(kind, key)
     if not data_p.exists():
@@ -112,7 +129,7 @@ def load(kind: str, key: str, *, fingerprint: Optional[str] = None,
             return default
     with open(data_p, "rb") as f:
         obj = pickle.load(f)
-    _MEM[mk] = (fingerprint, obj)
+    _mem_set(mk, (fingerprint, obj))
     return obj
 
 
@@ -120,7 +137,7 @@ def save(kind: str, key: str, obj: Any, *,
          fingerprint: Optional[str] = None) -> None:
     if not is_enabled():
         return
-    _MEM[_mk(kind, key)] = (fingerprint, obj)
+    _mem_set(_mk(kind, key), (fingerprint, obj))
     data_p, meta_p = _paths(kind, key)
     data_p.parent.mkdir(parents=True, exist_ok=True)
     tmp = data_p.with_suffix(".pkl.tmp")
@@ -149,7 +166,7 @@ def get_or_compute(kind: str, key: str, compute_fn: Callable[[], Any], *,
     if is_fold_invariant(kind) or force:
         save(kind, key, obj, fingerprint=fingerprint)
     else:
-        _MEM[_mk(kind, key)] = (fingerprint, obj)
+        _mem_set(_mk(kind, key), (fingerprint, obj))
     return obj
 
 
@@ -224,6 +241,24 @@ if __name__ == "__main__":
     # --- clear removes a kind ---
     clear(inv_kind)
     assert not has(inv_kind, "once", fingerprint=fp)
+
+    # --- bounded _MEM: LRU eviction never breaks correctness (fold-invariant
+    # kinds always have a disk copy to fall back to) ---
+    prev_cap = getattr(cfg, "CACHE_MEM_MAX_ENTRIES", 40)
+    cfg.CACHE_MEM_MAX_ENTRIES = 3
+    _MEM.clear()
+    try:
+        for i in range(6):
+            save(inv_kind, f"lru{i}", np.array([i]), fingerprint=fp)
+        assert len(_MEM) <= 3, f"_MEM exceeded cap: {len(_MEM)} entries"
+        assert (inv_kind, "lru0") not in _MEM, "oldest entry should have been evicted"
+        # DATA is still correct even after eviction -- served from disk instead
+        assert load(inv_kind, "lru0", fingerprint=fp)[0] == 0
+        assert load(inv_kind, "lru5", fingerprint=fp)[0] == 5
+        assert has(inv_kind, "lru0", fingerprint=fp)
+    finally:
+        cfg.CACHE_MEM_MAX_ENTRIES = prev_cap
+        _MEM.clear()
 
     cfg.CACHE_ENABLED = prev_enabled
     shutil.rmtree(cfg.CACHE_DIR, ignore_errors=True)

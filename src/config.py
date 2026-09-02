@@ -459,6 +459,21 @@ CACHE_FOLD_INVARIANT: tuple[str, ...] = (
     "all_fold_references", "all_fold_features",
 )
 
+# In-memory memoization cache (src/data/cache.py's `_MEM`) is a SAME-RUN
+# speed shortcut sitting in front of the disk cache above -- every entry it
+# holds also has (or will have) a durable copy on disk, so evicting one just
+# means the next access re-reads from disk; never a correctness risk. Left
+# unbounded, a single long-lived process (the main process walking all
+# patients during the level-2 reference-build barrier, or a worker reused
+# across several patients) accumulates ~130 MiB (g_patient + patient_anchor_
+# means + d_baseline) per patient it ever touches, for as long as it stays
+# alive -- e.g. ~2.9 GiB in the main process alone, before level-2 even
+# starts. Freed when the process exits, but that's cold comfort mid-run:
+# this standing cost competes with real working memory for the ENTIRE run.
+# Bounded via the same LRU pattern already used for ChbSpdProvider's signal
+# cache.
+CACHE_MEM_MAX_ENTRIES: int = 40
+
 
 # ---------------------------------------------------------------------------
 # 11. Tier-2 CPU multiprocessing (patient-parallel level-1 / level-2 sweeps)
