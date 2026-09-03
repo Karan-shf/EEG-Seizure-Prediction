@@ -197,7 +197,7 @@ def _run_pool(job_fn, job_args: List[tuple], *, n_workers: Optional[int] = None)
                                   # different OS's platform default happens
                                   # to be
     results: List[JobResult] = []
-    with ctx.Pool(processes=n, initializer=_worker_init) as pool:
+    with ctx.Pool(processes=n, initializer=_worker_init, maxtasksperchild=1) as pool:
         for res in pool.imap_unordered(job_fn, job_args, chunksize=1):
             status = "OK" if res.ok else f"FAILED: {res.error}"
             log.info("  %s: %s (%.1fs, %d windows)",

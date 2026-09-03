@@ -370,6 +370,38 @@ def jbld_distance(P, Q) -> np.ndarray:
     return np.sqrt(np.clip(div, 0.0, None))
 
 
+def jbld_divergence_from_logdets(P, Q, logdet_p, logdet_q) -> np.ndarray:
+    """JBLD divergence when log det(P) and log det(Q) are ALREADY KNOWN.
+
+    Only the (P,Q)-dependent log det((P+Q)/2) term is computed here -- the
+    two single-matrix logdets are NOT recomputed, unlike jbld_divergence()
+    which recomputes everything from scratch on every call. This matters a
+    lot when the SAME P is compared against many Q's (or vice versa): e.g.
+    dataset_builder's all-fold batched distance tensor compares every window
+    against a fixed batch of N fold references -- logdet(Q) for that batch
+    never changes across windows (compute it ONCE per batch, not once per
+    window), and logdet(P) for one window never changes across the
+    interictal/preictal comparisons made for it (compute it ONCE per
+    window, not once per reference). Naively recomputing both was found to
+    be the dominant real-world cost of the batched design -- for a batch of
+    8 folds, thousands of redundant 180x180 Cholesky factorizations per
+    window that never needed to change.
+    """
+    P = _np(P)
+    Q = _np(Q)
+    avg = symmetrize(0.5 * (P + Q))
+    return logdet_spd(avg) - 0.5 * (logdet_p + logdet_q)
+
+
+def jbld_distance_from_logdets(P, Q, logdet_p, logdet_q) -> np.ndarray:
+    """sqrt(jbld_divergence_from_logdets(...)) -- see that function's
+    docstring. Drop-in replacement for jbld_distance() wherever logdet(P)
+    and/or logdet(Q) are already known and reusable across several calls.
+    """
+    div = jbld_divergence_from_logdets(P, Q, logdet_p, logdet_q)
+    return np.sqrt(np.clip(div, 0.0, None))
+
+
 # ---------------------------------------------------------------------------
 # Frechet (Karcher) mean under AIRM
 # ---------------------------------------------------------------------------
@@ -519,6 +551,15 @@ if __name__ == "__main__":
     assert ref_jbld >= -1e-9, "JBLD divergence must be non-negative for SPD inputs"
     assert np.allclose(jbld_divergence(P, Q), ref_jbld, atol=1e-6)
     assert np.allclose(jbld_distance(P, Q), np.sqrt(max(ref_jbld, 0.0)), atol=1e-6)
+
+    # --- jbld_*_from_logdets must match the from-scratch versions exactly,
+    # given the correct precomputed logdets ---
+    logdet_P = logdet_spd(P)
+    logdet_Q = logdet_spd(Q)
+    assert np.allclose(jbld_divergence_from_logdets(P, Q, logdet_P, logdet_Q),
+                       jbld_divergence(P, Q), atol=1e-9)
+    assert np.allclose(jbld_distance_from_logdets(P, Q, logdet_P, logdet_Q),
+                       jbld_distance(P, Q), atol=1e-9)
 
     # batched logdet_spd matches np.linalg.slogdet
     Cb = rand_spd((4,))

@@ -461,8 +461,18 @@ def _patient_all_fold_distance_tensor(provider, pid, *, fold_order, fingerprint,
     """Distances for one patient vs EVERY fold's anchor, processed in GROUPS
     of cfg.ALL_FOLD_DISTANCE_BATCH_SIZE folds. For EACH group: load just
     that group's fold references (cache hit, cheap disk read), stream this
-    patient's windows ONCE against just that group, discard the group, move
-    on. batch_size >= n_folds collapses this to exactly one pass total.
+    patient's windows ONCE against just that group, discard the group,
+    move on. batch_size >= n_folds collapses this to exactly one pass total.
+
+    Uses bk.jbld_distance_from_logdets rather than distances.population_
+    distances: a reference batch's log-det is fixed for the WHOLE window
+    loop below (never changes window to window) and a window's own log-det
+    is fixed across its interictal/preictal comparisons -- recomputing
+    either from scratch per call turned out to be the dominant real cost
+    here. Precomputing both removes that redundancy entirely; only the
+    genuinely window-and-fold-dependent term (log det((cp+M)/2)) is still
+    computed per (window, fold) pair, which is the real, unavoidable cost
+    of covering all n_folds anchors.
 
     D : (n_windows, n_folds, n_channels, span, n_references) at the full
         SPAN_MAX, in fold_order order.
@@ -485,6 +495,10 @@ def _patient_all_fold_distance_tensor(provider, pid, *, fold_order, fingerprint,
             build_one_fold_reference(provider, fold_order, f,
                                      fingerprint=fingerprint, tag=tag).get("preictal")
             for f in group])
+        # Fixed for the ENTIRE window loop below -- compute ONCE per batch,
+        # not once per window (this was the dominant redundant cost).
+        logdet_int_b = bk.logdet_spd(m_int_b)
+        logdet_pre_b = bk.logdet_spd(m_pre_b)
         nc, sr = m_int_b.shape[1:3]
         if D is None:
             D = np.zeros((n_windows, n_folds, nc, sr, cfg.N_REFERENCES), dtype=float)
@@ -492,12 +506,17 @@ def _patient_all_fold_distance_tensor(provider, pid, *, fold_order, fingerprint,
         idx = 0
         for (C, _lab) in provider.iter_windows(pid):
             cp = al.recenter(np.asarray(C, dtype=float), g_invsqrt=g_invsqrt)
+            logdet_cp = bk.logdet_spd(cp)  # fixed across the 2 calls below --
+                                            # compute ONCE per window, not twice
             d_base = base.d_baseline[idx]                                    # (nc, sr)
             D[idx, start:end, :, :, 0] = np.broadcast_to(d_base, (end - start,) + d_base.shape)
-            D[idx, start:end, :, :, 1] = dist.population_distances(cp, m_int_b)
-            D[idx, start:end, :, :, 2] = dist.population_distances(cp, m_pre_b)
+            D[idx, start:end, :, :, 1] = bk.jbld_distance_from_logdets(
+                cp, m_int_b, logdet_cp, logdet_int_b)
+            D[idx, start:end, :, :, 2] = bk.jbld_distance_from_logdets(
+                cp, m_pre_b, logdet_cp, logdet_pre_b)
             idx += 1
-        del m_int_b, m_pre_b  # explicit: this group's data must not outlive its own pass
+        del m_int_b, m_pre_b, logdet_int_b, logdet_pre_b  # explicit: this
+            # group's data must not outlive its own pass
 
     if D is None:
         D = np.zeros((n_windows, 0, 0, 0, cfg.N_REFERENCES), dtype=float)
