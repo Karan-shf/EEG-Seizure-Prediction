@@ -261,32 +261,35 @@ def _run_all(args: argparse.Namespace) -> int:
     # Force the eligibility gate on, then run the full sweep over survivors.
     args.eligible_only = True
 
-    if args.mode == "precomputed":
+    if args.mode in ("precomputed", "fastest"):
         # Resolve eligible patients ONCE and reuse the same list for both
-        # precompute and the grid, instead of running inventory twice.
+        # the parallel cache build and the grid, instead of running
+        # inventory twice.
         patients = _resolve_eligible(args)
         pats = patients if patients else list(lopo_mod.DEFAULT_PATIENTS)
         alphas = tuple(cfg.SWEEP_ALPHA if args.alphas is None else args.alphas)
+        builder = (parallel_build.run_precompute_parallel if args.mode == "precomputed"
+                  else parallel_build.run_precompute_fastest_parallel)
 
-        print(f"all (precomputed mode): building cache for {len(pats)} patient(s) "
+        print(f"all ({args.mode} mode): building cache for {len(pats)} patient(s) "
               f"x {len(alphas)} alpha(s) {list(alphas)} first...")
         for a in alphas:
-            print(f"\n=== precompute alpha={a:.2f} ===")
-            out = parallel_build.run_precompute_parallel(
-                pats, alpha=a, raw_dir=args.raw_dir, sop_minutes=args.sop,
-                n_workers=args.n_workers)
+            print(f"\n=== precompute ({args.mode}) alpha={a:.2f} ===")
+            out = builder(pats, alpha=a, raw_dir=args.raw_dir, sop_minutes=args.sop,
+                          n_workers=args.n_workers)
             n1_ok = sum(r.ok for r in out["level1"])
             n2_ok = sum(r.ok for r in out["level2"])
             print(f"  level-1: {n1_ok}/{len(out['level1'])} OK   "
                   f"level-2: {n2_ok}/{len(out['level2'])} OK")
             if n1_ok < len(out["level1"]) or n2_ok < len(out["level2"]):
-                log.error("precompute alpha=%.2f: incomplete -- see logged errors above", a)
+                log.error("precompute (%s) alpha=%.2f: incomplete -- see logged errors above",
+                          args.mode, a)
                 return 1
 
         # Hand the grid the SAME already-resolved list; skip re-running inventory.
         args.patients = pats
         args.eligible_only = False
-        print("\nprecompute complete -> running grid from cache...\n")
+        print(f"\nprecompute ({args.mode}) complete -> running grid from cache...\n")
 
     return _run_grid(args)
 
@@ -307,13 +310,16 @@ def _add_common(sp: argparse.ArgumentParser, *, with_eligible: bool) -> None:
                     help=f"target FPR/h (default: {cfg.PRIMARY_TARGET_FPR_PER_HOUR})")
     sp.add_argument("--seed", type=int, default=None,
                     help=f"random seed (default: {cfg.SEED})")
-    sp.add_argument("--mode", choices=("exact", "fast", "precomputed"), default=cfg.FEATURE_ANCHOR_MODE,
-                    help="feature-anchor mode: 'fast' = Tier-1 purist cached global "
-                         "anchor (~10x less streaming, small approximation); "
-                         "'precomputed' = exact per-fold leave-one-out anchors for "
-                         "EVERY fold, each patient streamed exactly once for the "
-                         "whole sweep -- same speed as 'fast' with zero approximation; "
-                         f"default: {cfg.FEATURE_ANCHOR_MODE}")
+    sp.add_argument("--mode", choices=("exact", "fast", "precomputed", "fastest"),
+                    default=cfg.FEATURE_ANCHOR_MODE,
+                    help="feature-anchor mode: 'fast' = Tier-1 purist (exact "
+                         "leakage-free TEST side, global anchor for TRAIN); "
+                         "'precomputed' = exact leave-one-out anchors for "
+                         "EVERY fold, same speed as fast with zero approximation; "
+                         "'fastest' = ONE global anchor for EVERYONE incl. the "
+                         "held-out patient -- deliberate ~1/24 leakage, never "
+                         "trust its metrics without comparing against another "
+                         f"mode first; default: {cfg.FEATURE_ANCHOR_MODE}")
     if with_eligible:
         sp.add_argument("--eligible-only", action="store_true",
                         help="run inventory first and keep only eligible patients")

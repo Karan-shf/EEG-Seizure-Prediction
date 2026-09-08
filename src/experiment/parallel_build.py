@@ -295,6 +295,94 @@ def run_precompute_parallel(patients: Sequence[str], *, alpha: float,
     return {"level1": l1, "level2": l2}
 
 
+def _level2_fastest_job(args) -> JobResult:
+    """One patient's 'fastest'-mode global feature stream -- see
+    dataset_builder.build_fold_fastest. Runs inside a worker process.
+    global_references is already cached (built once, in the main process,
+    before this pool spawned -- see run_level2_fastest_parallel), so this
+    is expected to be a cheap cache hit, never a recompute."""
+    patient_id, alpha, raw_dir, sop_minutes, fingerprint, tag, patient_ids = args
+    pid = os.getpid()
+    t0 = time.perf_counter()
+    log.info("level2fastest START patient=%s pid=%d", patient_id, pid)
+    try:
+        from src.experiment.lopo import ChbSpdProvider
+        from src.data import dataset_builder as db
+
+        provider = ChbSpdProvider([patient_id], alpha=alpha, raw_dir=raw_dir,
+                                  sop_minutes=sop_minutes)
+        R_global = db.global_references(provider, patient_ids, fingerprint=fingerprint, tag=tag)
+        gf = db.patient_global_features(provider, patient_id, references=R_global,
+                                        fingerprint=fingerprint, tag=tag)
+        elapsed = time.perf_counter() - t0
+        log.info("level2fastest END   patient=%s pid=%d elapsed=%.1fs windows=%d",
+                 patient_id, pid, elapsed, len(gf["y"]))
+        return JobResult(patient_id, True, elapsed, n_windows=len(gf["y"]))
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.perf_counter() - t0
+        log.error("level2fastest FAILED patient=%s pid=%d elapsed=%.1fs error=%r",
+                  patient_id, pid, elapsed, exc)
+        return JobResult(patient_id, False, elapsed, error=repr(exc))
+
+
+def run_level2_fastest_parallel(patients: Sequence[str], *, alpha: float,
+                                raw_dir: Optional[Path] = None,
+                                sop_minutes: Optional[int] = None,
+                                n_workers: Optional[int] = None) -> List[JobResult]:
+    """'Fastest'-mode level-2: build the ONE shared global anchor
+    (sequential, main process, cheap -- only averages already-cached
+    level-1 means), THEN stream every patient's windows exactly once
+    against it, in parallel. Requires level-1 already complete for every
+    patient (call run_level1_parallel first, or use
+    run_precompute_fastest_parallel).
+    """
+    from src.experiment.lopo import ChbSpdProvider, _alpha_fingerprint
+    from src.data import dataset_builder as db
+
+    fp = _alpha_fingerprint(alpha)
+    ids = list(patients)
+    tag = db._fast_tag(ids, alpha)
+
+    log.info("level2 (fastest): building the shared global anchor (main process)...")
+    provider = ChbSpdProvider(ids, alpha=alpha, raw_dir=raw_dir, sop_minutes=sop_minutes)
+    t0 = time.perf_counter()
+    db.global_references(provider, ids, fingerprint=fp, tag=tag)
+    log.info("level2 (fastest): global anchor ready in %.1fs", time.perf_counter() - t0)
+
+    job_args = [(p, alpha, raw_dir, sop_minutes, fp, tag, ids) for p in ids]
+
+    t1 = time.perf_counter()
+    results = _run_pool(_level2_fastest_job, job_args, n_workers=n_workers)
+    elapsed = time.perf_counter() - t1
+
+    failed = [r for r in results if not r.ok]
+    log.info("level-2 (fastest) parallel: %d/%d patients OK in %.1fs (%.1f min)",
+             len(results) - len(failed), len(results), elapsed, elapsed / 60)
+    if failed:
+        log.error("level-2 (fastest) parallel: %d patient(s) FAILED: %s",
+                  len(failed), [r.patient_id for r in failed])
+    return results
+
+
+def run_precompute_fastest_parallel(patients: Sequence[str], *, alpha: float,
+                                    raw_dir: Optional[Path] = None,
+                                    sop_minutes: Optional[int] = None,
+                                    n_workers: Optional[int] = None) -> Dict[str, List[JobResult]]:
+    """Convenience: level-1 to completion, THEN the 'fastest'-mode global
+    feature build. Raises if any level-1 patient failed -- the global
+    anchor needs EVERY patient's level-1 result."""
+    l1 = run_level1_parallel(patients, alpha=alpha, raw_dir=raw_dir,
+                             sop_minutes=sop_minutes, n_workers=n_workers)
+    if any(not r.ok for r in l1):
+        raise RuntimeError(
+            "level-1 had failures; refusing to start level-2 (fastest) -- "
+            "its global anchor needs EVERY patient's level-1 result. See "
+            "the logged errors above.")
+    l2 = run_level2_fastest_parallel(patients, alpha=alpha, raw_dir=raw_dir,
+                                     sop_minutes=sop_minutes, n_workers=n_workers)
+    return {"level1": l1, "level2": l2}
+
+
 # ---------------------------------------------------------------------------
 # Self-test: proves the POOL PLUMBING (spawn, pickling function references,
 # initializer invocation, imap_unordered dispatch across distinct worker
