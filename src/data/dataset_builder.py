@@ -603,6 +603,76 @@ def build_lopo_precomputed(provider, *, span_roof: int | None = None,
     return folds
 
 
+def build_fold_fastest(provider, test_patient, *, span_roof: int | None = None,
+                       fingerprint: str | None = None, alpha: float | None = None) -> FoldData:
+    """The original design doc's 'Fastest' Tier-1 variant: a SINGLE global
+    anchor (over ALL patients, held-out included) used for EVERY patient in
+    EVERY role -- train AND test alike. Every patient streamed EXACTLY ONCE,
+    ever, for the whole sweep; every fold is pure array slicing from that
+    one shared cache. Cheapest possible design in both memory (one ~80 MiB
+    anchor, not precomputed mode's ~2.9 GiB all-22-fold stack) and compute
+    (each window compared against 1 anchor set, not 22).
+
+    DELIBERATE, KNOWN LEAKAGE: the held-out patient contributes ~1/24 of the
+    weight to the SAME anchor used to score it. This is NOT `fast` mode's
+    test side (fast mode's test features are the exact, leakage-free
+    source-only LOO computation -- see build_fold(fast=True)). Never trust
+    a metric from this mode without comparing it against 'exact' or
+    'precomputed' mode on the same data first.
+    """
+    if alpha is None:
+        raise ValueError("build_fold_fastest needs `alpha` for the cache key")
+    fp = fingerprint or _fingerprint()
+    ids = list(provider.patient_ids())
+    if test_patient not in ids:
+        raise ValueError(f"unknown test patient {test_patient!r}")
+    span_roof = cfg.SPAN_MAX if span_roof is None else int(span_roof)
+    channels = tuple(provider.channels())
+    tag = _fast_tag(ids, alpha)
+
+    R_global = global_references(provider, ids, fingerprint=fp, tag=tag)
+
+    Xtr, ytr, gtr = [], [], []
+    Xte, yte = None, None
+    for p in ids:
+        gf = patient_global_features(provider, p, references=R_global,
+                                     fingerprint=fp, tag=tag)
+        X_p = _slice_features(gf["D"], span_roof)
+        if p == test_patient:
+            Xte, yte = X_p, gf["y"]
+        else:
+            Xtr.append(X_p)
+            ytr.append(gf["y"])
+            gtr.append(np.full(len(gf["y"]), p, dtype=object))
+
+    fnames = dist.feature_names(channels, span_roof)
+    width = cfg.N_REFERENCES * span_roof * len(channels)
+    source = tuple(p for p in ids if p != test_patient)
+
+    return FoldData(
+        test_patient=test_patient, source_patients=source,
+        span_roof=span_roof, feature_names=fnames,
+        X_train=np.concatenate(Xtr) if Xtr else np.empty((0, width)),
+        y_train=np.concatenate(ytr) if ytr else np.empty((0,), dtype=int),
+        train_patient_ids=np.concatenate(gtr) if gtr else np.empty((0,), dtype=object),
+        X_test=Xte if Xte is not None else np.empty((0, width)),
+        y_test=yte if yte is not None else np.empty((0,), dtype=int),
+        test_patient_ids=np.full(len(yte) if yte is not None else 0, test_patient, dtype=object),
+    )
+
+
+def build_lopo_fastest(provider, *, span_roof: int | None = None,
+                       alpha: float | None = None) -> list[FoldData]:
+    """Every LOPO fold under the 'Fastest' variant -- see build_fold_fastest."""
+    fp = _fingerprint()
+    folds = [build_fold_fastest(provider, p, span_roof=span_roof,
+                                fingerprint=fp, alpha=alpha)
+             for p in provider.patient_ids()]
+    log.info("build_lopo_fastest: %d folds, span_roof=%s", len(folds),
+             cfg.SPAN_MAX if span_roof is None else span_roof)
+    return folds
+
+
 def build_fold(provider: SpdWindowProvider, test_patient: str, *,
                span_roof: int | None = None, fingerprint: str | None = None,
                fast: bool = False, alpha: float | None = None) -> FoldData:
@@ -801,6 +871,22 @@ if __name__ == "__main__":
     assert cache.has("global_anchor", f"anchor_{tag05}", fingerprint=fp)
     assert cache.has("global_features", f"B_{tag05}", fingerprint=fp)
     assert cache.has("loo_features", f"A_{tag05}", fingerprint=fp)
+
+    # --- fastest variant: ONE global anchor for EVERYONE, deliberate leakage.
+    # Confirm it reuses the SAME cached global features fast mode's train side
+    # already produces (no separate computation path), and that its TEST
+    # features genuinely differ from the leakage-free LOO computation --
+    # proving the leakage is real and structurally distinct, not an
+    # accidental no-op.
+    fold_fastest_A = build_fold_fastest(provider, "A", span_roof=sr, alpha=0.5)
+    assert fold_fastest_A.X_test.shape == fold_exact.X_test.shape
+    assert not np.allclose(fold_fastest_A.X_test, fold_exact.X_test, atol=1e-6), \
+        "fastest mode's test features should differ from the leakage-free LOO computation"
+    assert cache.has("global_features", f"A_{tag05}", fingerprint=fp)
+
+    folds_fastest = build_lopo_fastest(provider, span_roof=sr, alpha=0.5)
+    assert len(folds_fastest) == len(provider.patient_ids())
+
     # alpha is part of the cache key -> no cross-alpha collision
     assert _fast_tag(provider.patient_ids(), 0.5) != _fast_tag(provider.patient_ids(), 1.0)
     build_fold(provider, "A", span_roof=sr, fast=True, alpha=1.0)
