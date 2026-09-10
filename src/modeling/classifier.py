@@ -94,6 +94,13 @@ def _svm_linear(**overrides):
     return SVC(**params)
 
 
+def _svm_linear_fast(**overrides):
+    from sklearn.svm import LinearSVC
+    params = {"C": 1.0, "max_iter": 5000, "dual": "auto", "random_state": cfg.SEED}
+    params.update(overrides)
+    return LinearSVC(**params)
+
+
 def _knn(**overrides):
     from sklearn.neighbors import KNeighborsClassifier
     params = {"n_neighbors": 15, "weights": "distance"}
@@ -111,8 +118,15 @@ def _random_forest(**overrides):
 
 def _mlp(**overrides):
     from sklearn.neural_network import MLPClassifier
-    params = {"hidden_layer_sizes": (128, 64), "activation": "relu",
-              "alpha": 1e-4, "max_iter": 500, "random_state": cfg.SEED}
+    params = {
+        "hidden_layer_sizes": (128, 64), 
+        "activation": "relu",
+        "alpha": 1e-4, 
+        "max_iter": 500, 
+        "random_state": cfg.SEED,
+        "early_stopping": True,
+        "n_iter_no_change": 15
+    }
     params.update(overrides)
     return MLPClassifier(**params)
 
@@ -121,6 +135,7 @@ register("lr", _lr, scale=True, description="Elastic-Net Logistic Regression (he
 register("lda", _lda, scale=True, description="Linear Discriminant Analysis")
 register("svm_rbf", _svm_rbf, scale=True, description="RBF-kernel SVM")
 register("svm_linear", _svm_linear, scale=True, description="linear-kernel SVM")
+register("svm_linear_fast", _svm_linear_fast, scale=True, description="liblinear-solver linear SVM (LinearSVC)")
 register("knn", _knn, scale=True, description="k-Nearest Neighbours")
 register("rf", _random_forest, scale=False, description="Random Forest")
 register("mlp", _mlp, scale=True, description="Multi-Layer Perceptron")
