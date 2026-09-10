@@ -58,6 +58,7 @@ from src.modeling import balancing
 from src.modeling import classifier as clf
 from src.evaluation import alarms as alarms_mod
 from src.evaluation import metrics as metrics_mod
+from src.experiment import few_shot
 
 # Import-light pipeline pieces (mne / scipy stay lazy inside their own modules).
 from src.io.summary_parser import parse_summary_file
@@ -279,8 +280,9 @@ def run_lopo(*, alpha: float, span_roof: Optional[int] = None,
                    if target_fpr_per_hour is None else target_fpr_per_hour)
     seed = cfg.SEED if seed is None else int(seed)
     mode = str(mode).lower()
-    if mode not in ("exact", "fast", "precomputed", "fastest"):
-        raise ValueError(f"mode must be 'exact', 'fast', 'precomputed', or 'fastest', got {mode!r}")
+    if mode not in ("exact", "fast", "precomputed", "fastest", "few_shot"):
+        raise ValueError(f"mode must be 'exact', 'fast', 'precomputed', 'fastest', "
+                         f"or 'few_shot', got {mode!r}")
 
     if provider is None:
         pats = tuple(patients) if patients else DEFAULT_PATIENTS
@@ -317,6 +319,18 @@ def run_lopo(*, alpha: float, span_roof: Optional[int] = None,
         elif mode == "fastest":
             fold = db.build_fold_fastest(provider, test_patient, span_roof=span_roof,
                                          fingerprint=fp, alpha=alpha)
+        elif mode == "few_shot":
+            # Needs a CLEAN (no-target-leakage) anchor to calibrate on top
+            # of -- built the same way 'precomputed' mode does, then
+            # reorganized by few_shot.apply_few_shot_split.
+            base_fold = db.build_fold_precomputed(provider, test_patient, span_roof=span_roof,
+                                                  fingerprint=fp, alpha=alpha)
+            try:
+                fold = few_shot.apply_few_shot_split(
+                    base_fold, provider, test_patient, seed=seed).fold
+            except ValueError as exc:
+                log.warning("skip fold %s: %s", test_patient, exc)
+                continue
         else:
             fold = db.build_fold(provider, test_patient, span_roof=span_roof,
                                  fingerprint=fp, fast=(mode == "fast"), alpha=alpha)

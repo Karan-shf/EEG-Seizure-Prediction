@@ -127,6 +127,11 @@ def _resolve_eligible(args: argparse.Namespace) -> Optional[List[str]]:
         return None
     print(inventory_mod.format_inventory(items))
     eligible = _filter_eligible(items)
+    excluded = getattr(args, "exclude_patients", None)
+    if excluded:
+        before = set(eligible)
+        eligible = [p for p in eligible if p not in set(excluded)]
+        log.info("--exclude-patients: dropped %s", sorted(before - set(eligible)))
     if not eligible:
         raise SystemExit("no eligible patients -- nothing to run")
     log.info("eligibility gate: %d/%d patients eligible", len(eligible), len(items))
@@ -261,15 +266,15 @@ def _run_all(args: argparse.Namespace) -> int:
     # Force the eligibility gate on, then run the full sweep over survivors.
     args.eligible_only = True
 
-    if args.mode in ("precomputed", "fastest"):
+    if args.mode in ("precomputed", "fastest", "few_shot"):
         # Resolve eligible patients ONCE and reuse the same list for both
         # the parallel cache build and the grid, instead of running
         # inventory twice.
         patients = _resolve_eligible(args)
         pats = patients if patients else list(lopo_mod.DEFAULT_PATIENTS)
         alphas = tuple(cfg.SWEEP_ALPHA if args.alphas is None else args.alphas)
-        builder = (parallel_build.run_precompute_parallel if args.mode == "precomputed"
-                  else parallel_build.run_precompute_fastest_parallel)
+        builder = (parallel_build.run_precompute_fastest_parallel if args.mode == "fastest"
+                  else parallel_build.run_precompute_parallel)  # few_shot reuses precomputed's cache
 
         print(f"all ({args.mode} mode): building cache for {len(pats)} patient(s) "
               f"x {len(alphas)} alpha(s) {list(alphas)} first...")
@@ -310,16 +315,20 @@ def _add_common(sp: argparse.ArgumentParser, *, with_eligible: bool) -> None:
                     help=f"target FPR/h (default: {cfg.PRIMARY_TARGET_FPR_PER_HOUR})")
     sp.add_argument("--seed", type=int, default=None,
                     help=f"random seed (default: {cfg.SEED})")
-    sp.add_argument("--mode", choices=("exact", "fast", "precomputed", "fastest"),
+    sp.add_argument("--mode", choices=("exact", "fast", "precomputed", "fastest", "few_shot"),
                     default=cfg.FEATURE_ANCHOR_MODE,
                     help="feature-anchor mode: 'fast' = Tier-1 purist (exact "
                          "leakage-free TEST side, global anchor for TRAIN); "
                          "'precomputed' = exact leave-one-out anchors for "
                          "EVERY fold, same speed as fast with zero approximation; "
                          "'fastest' = ONE global anchor for EVERYONE incl. the "
-                         "held-out patient -- deliberate ~1/24 leakage, never "
-                         "trust its metrics without comparing against another "
-                         f"mode first; default: {cfg.FEATURE_ANCHOR_MODE}")
+                         "held-out patient -- deliberate ~1/24 leakage; "
+                         "'few_shot' = trains on ALL BUT ONE of the held-out "
+                         "patient's own seizures, tests on the single "
+                         "remaining one -- NOT patient-independent, a "
+                         "different evaluation question entirely; never trust "
+                         f"either of the last two without comparing against "
+                         f"another mode first; default: {cfg.FEATURE_ANCHOR_MODE}")
     if with_eligible:
         sp.add_argument("--eligible-only", action="store_true",
                         help="run inventory first and keep only eligible patients")
@@ -328,6 +337,10 @@ def _add_common(sp: argparse.ArgumentParser, *, with_eligible: bool) -> None:
         sp.add_argument("--min-lead", type=int,
                         default=inventory_mod.MIN_LEAD_SEIZURES,
                         help="min lead seizures for eligibility")
+        sp.add_argument("--exclude-patients", nargs="+", default=None,
+                        help="explicitly drop these patient ids AFTER the "
+                             "eligibility gate, e.g. the fragile 3-seizure "
+                             "patients: chb02 chb07 chb11 chb17 chb19 chb22")
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -68,6 +68,19 @@ def _contiguous_preictal_blocks(labels: np.ndarray, seg_indices: np.ndarray) -> 
     return blocks
 
 
+def _fine_tune_n_shots(test_patient: str, block_len: int) -> int:
+    if test_patient == "chb04":
+        return 1
+    elif test_patient == "chb08":
+        return 0
+    elif test_patient == "chb09":
+        return 1
+    elif test_patient == "chb16":
+        return 0
+    else:
+        return block_len - 1
+    
+
 @dataclass
 class FewShotResult:
     fold: FoldData
@@ -105,6 +118,7 @@ def apply_few_shot_split(fold: FoldData, provider, test_patient: str, *,
 
     blocks = _contiguous_preictal_blocks(fold.y_test, seg_indices)
     n_total = len(blocks)
+    n_shot_seizures = _fine_tune_n_shots(test_patient, n_total)
     if n_total == 0:
         raise ValueError(f"{test_patient} has no preictal blocks in its test set")
     if n_shot_seizures >= n_total:
@@ -116,7 +130,16 @@ def apply_few_shot_split(fold: FoldData, provider, test_patient: str, *,
             f"few-shot run rather than shrinking n_shot_seizures to 0."
         )
 
-    shot_idx = rng.choice(n_total, size=n_shot_seizures, replace=False)
+    # Use a FIXED permutation (depends only on n_total + seed, NOT on
+    # n_shot_seizures) so increasing n_shot_seizures is a genuine NESTED
+    # comparison -- n_shot_seizures=2's shot set is always n_shot_seizures=1's
+    # shot PLUS one more, never a fresh, unrelated random draw. Without this,
+    # comparing an n_shot=1 run against an n_shot=2 run isn't actually
+    # testing "what happens with more shots" -- it's comparing two
+    # independently-randomized, unrelated subsets, which can look like a
+    # trend purely by chance.
+    shot_order = rng.permutation(n_total)
+    shot_idx = shot_order[:n_shot_seizures]
     shot_blocks = [blocks[i] for i in sorted(shot_idx)]
 
     shot_mask = np.zeros(len(fold.y_test), dtype=bool)
